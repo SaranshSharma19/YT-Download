@@ -1,72 +1,61 @@
+from pathlib import Path
+import streamlit as st
 import yt_dlp
 import os
-from pathlib import Path
-import logging
+import imageio_ffmpeg
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-def validate_url(url: str) -> bool:
-    """Validate if the URL is a valid YouTube URL."""
-    return "youtube.com" in url or "youtu.be" in url
-
-def download_youtube_video(video_url: str, save_path: str) -> str:
-    """
-    Download YouTube video with enhanced error handling.
-    
-    Args:
-        video_url (str): YouTube video URL
-        save_path (str): Directory to save the downloaded video
-        
-    Returns:
-        str: Status message indicating the result
-    """
+def download_youtube_video(video_url, save_path):
     try:
-        if not validate_url(video_url):
-            return "Invalid YouTube URL. Please check the URL and try again."
-        
-        # Define output filename explicitly
-        output_filename = Path(save_path) / "downloaded_video.mp4"
+        print(f"Downloading video from: {video_url}")
 
-        # yt-dlp options
         ydl_opts = {
-            'format': 'best',  # Simplified format setting for highest quality
-            'outtmpl': str(output_filename),  # Force specific output filename
+            'format': 'bestvideo+bestaudio',
+            'merge_output_format': 'mp4',
+            'outtmpl': os.path.join(save_path, '%(title)s.%(ext)s'),
+            'quiet': False,
+            'no_warnings': True,
+            'concurrent-fragments': 5,
             'retries': 3,
-            'ffmpeg_location': None,
-            'nocheckcertificate': True,
-            'verbose': True  # Enable detailed yt-dlp output
+            'fragment-retries': 5,
+            'external-downloader': 'aria2c',
+            'external-downloader-args': ['-x', '16', '-s', '16', '-k', '1M'],
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4'  # Ensure the output is in a compatible format
+            }],
+            'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()
         }
-        
-        # Log existing files in save_path before download
-        logger.info(f"Contents of save path ({save_path}) before download:")
-        logger.info(list(Path(save_path).glob("*")))
-        
-        # Start download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            logger.info("Starting download...")
-            ydl.download([video_url])
-
-        # Verify file exists and has size > 0
-        if output_filename.exists() and output_filename.stat().st_size > 0:
-            logger.info(f"Download successful! File located at: {output_filename}")
-            return f"Video downloaded successfully: {output_filename}"
-        else:
-            logger.error("Download completed but file verification failed.")
-            return "Download completed but file verification failed."
-
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"Download error: {e}")
-        return f"Download failed: {str(e)}"
+            print("Downloading video...")
+            info = ydl.extract_info(video_url, download=True)
+            file_path = os.path.join(save_path, f"{info['title']}.mp4")
+        
+        print('Video downloaded successfully!')
+        return file_path, "Video downloaded successfully!"
+        
     except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        return f"An unexpected error occurred: {str(e)}"
+        print(f"An error occurred: {e}")
+        return None, f"An error occurred: {e}"
 
-# Test function
-if __name__ == "__main__":
-    url = input("Enter YouTube URL to download: ")
-    save_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-    os.makedirs(save_dir, exist_ok=True)
-    status = download_youtube_video(url, save_dir)
-    print(status)
+st.title("YouTube Video Downloader")
+
+video_url = st.text_input("Enter YouTube video URL:")
+
+if st.button("Download Video"):
+    if video_url:
+        save_path = os.path.join(os.path.expanduser("~"), "Downloads")
+        file_path, status = download_youtube_video(video_url, save_path)
+        
+        if file_path:
+            st.success(status)
+            with open(file_path, "rb") as file:
+                st.download_button(
+                    label="Click here to download the video",
+                    data=file,
+                    file_name=os.path.basename(file_path),
+                    mime="video/mp4"
+                )
+        else:
+            st.error(status)
+    else:
+        st.error("Please enter a valid YouTube URL.")
