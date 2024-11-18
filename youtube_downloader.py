@@ -4,31 +4,68 @@ import os
 import tempfile
 import shutil
 from pathlib import Path
-import time
-import random
+import subprocess
+import sys
+import platform
 
-def sanitize_filename(filename):
-    """Create a safe filename."""
-    # Remove or replace unsafe characters
-    unsafe_chars = '<>:"/\\|?*'
-    for char in unsafe_chars:
-        filename = filename.replace(char, '_')
-    # Limit length to avoid path too long errors
-    return filename[:200]
+def check_ffmpeg():
+    """Check if FFmpeg is installed and accessible."""
+    try:
+        # Try to run ffmpeg
+        subprocess.run(['ffmpeg', '-version'], capture_output=True)
+        return True
+    except FileNotFoundError:
+        return False
 
-def get_unique_filename(base_path, title):
-    """Generate a unique filename if file already exists."""
-    base = sanitize_filename(title)
-    path = os.path.join(base_path, f"{base}.mp4")
-    counter = 1
-    while os.path.exists(path):
-        path = os.path.join(base_path, f"{base}_{counter}.mp4")
-        counter += 1
-    return path
+def get_installation_instructions():
+    """Get FFmpeg installation instructions based on OS."""
+    system = platform.system().lower()
+    
+    if system == 'windows':
+        return """
+        To install FFmpeg on Windows:
+        1. Download FFmpeg from https://www.gyan.dev/ffmpeg/builds/
+        2. Extract the zip file
+        3. Add the bin folder to your System PATH
+        
+        Alternatively, use the command:
+        ```
+        winget install FFmpeg
+        ```
+        """
+    elif system == 'darwin':  # macOS
+        return """
+        To install FFmpeg on macOS:
+        1. Install Homebrew if not installed:
+           ```
+           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+           ```
+        2. Install FFmpeg:
+           ```
+           brew install ffmpeg
+           ```
+        """
+    else:  # Linux
+        return """
+        To install FFmpeg on Linux:
+        
+        Ubuntu/Debian:
+        ```
+        sudo apt update
+        sudo apt install ffmpeg
+        ```
+        
+        Fedora:
+        ```
+        sudo dnf install ffmpeg
+        ```
+        """
 
 def download_youtube_video(video_url: str, save_path: str):
-    """Download YouTube video with enhanced file handling."""
-    # Create a temporary directory for downloading
+    """Download YouTube video with FFmpeg check."""
+    if not check_ffmpeg():
+        return None, "FFmpeg is not installed. Please install FFmpeg first."
+    
     temp_dir = tempfile.mkdtemp()
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -55,12 +92,10 @@ def download_youtube_video(video_url: str, save_path: str):
             'merge_output_format': 'mp4',
             'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
             'progress_hooks': [progress_hook],
-            'retries': 5,
-            'fragment_retries': 5,
+            'retries': 3,
+            'fragment_retries': 3,
             'ignoreerrors': False,
             'no_warnings': True,
-            'quiet': True,
-            'noprogress': False,
             'postprocessor_args': [
                 '-c:v', 'copy',
                 '-c:a', 'aac',
@@ -68,56 +103,26 @@ def download_youtube_video(video_url: str, save_path: str):
             ]
         }
 
-        status_text.text("Extracting video information...")
-        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # First get video info
-            info = ydl.extract_info(video_url, download=False)
-            if not info:
-                return None, "Could not extract video information"
+            info = ydl.extract_info(video_url, download=True)
+            if info is None:
+                return None, "Could not download video"
             
-            video_title = info.get('title', 'video')
-            temp_path = os.path.join(temp_dir, f"{video_title}.mp4")
+            video_path = os.path.join(temp_dir, ydl.prepare_filename(info))
+            if not os.path.exists(video_path):
+                video_path = video_path.rsplit('.', 1)[0] + '.mp4'
             
-            # Download the video
-            status_text.text("Starting download...")
-            ydl.download([video_url])
+            if not os.path.exists(video_path):
+                return None, "Downloaded file not found"
             
-            # Find the downloaded file
-            downloaded_files = [f for f in os.listdir(temp_dir) if f.endswith('.mp4')]
-            if not downloaded_files:
-                return None, "No video file found after download"
+            final_path = os.path.join(save_path, os.path.basename(video_path))
+            shutil.move(video_path, final_path)
             
-            # Get the actual downloaded file
-            temp_file = os.path.join(temp_dir, downloaded_files[0])
-            if not os.path.exists(temp_file):
-                return None, "Downloaded file not found in temporary directory"
+            return final_path, "Video downloaded successfully!"
             
-            # Verify file size
-            if os.path.getsize(temp_file) < 1024:  # Less than 1KB
-                return None, "Downloaded file is too small, likely corrupted"
-            
-            # Create final path
-            final_path = get_unique_filename(save_path, video_title)
-            
-            # Move file to final location
-            try:
-                shutil.move(temp_file, final_path)
-            except Exception as e:
-                return None, f"Error moving file: {str(e)}"
-            
-            # Final verification
-            if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
-                return final_path, "Video downloaded successfully!"
-            else:
-                return None, "File verification failed after moving"
-            
-    except yt_dlp.utils.DownloadError as e:
-        return None, f"Download error: {str(e)}"
     except Exception as e:
-        return None, f"An error occurred: {str(e)}"
+        return None, f"Download error: {str(e)}"
     finally:
-        # Cleanup
         try:
             shutil.rmtree(temp_dir)
         except:
@@ -126,25 +131,28 @@ def download_youtube_video(video_url: str, save_path: str):
         status_text.empty()
 
 def main():
-    st.set_page_config(
-        page_title="YouTube Video Downloader",
-        page_icon="▶️",
-        initial_sidebar_state="collapsed"
-    )
+    st.set_page_config(page_title="YouTube Video Downloader", page_icon="▶️")
     
     st.title("▶️ YouTube Video Downloader")
+    
+    # Check FFmpeg installation
+    if not check_ffmpeg():
+        st.error("⚠️ FFmpeg is not installed!")
+        st.markdown("### FFmpeg Installation Instructions")
+        st.code(get_installation_instructions())
+        st.warning("After installing FFmpeg, please restart this application.")
+        return
+
     st.markdown("""
     Download YouTube videos in highest quality MP4 format.
     Please ensure you have the right to download the video content.
     """)
 
-    # Input for video URL
     video_url = st.text_input(
         "Enter YouTube video URL:",
         placeholder="https://youtube.com/watch?v=..."
     )
     
-    # Download section
     if st.button("Download Video", type="primary"):
         if not video_url:
             st.error("Please enter a YouTube URL.")
@@ -154,22 +162,16 @@ def main():
             st.error("Please enter a valid YouTube URL.")
             return
             
-        # Create downloads directory if it doesn't exist
         downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
         os.makedirs(downloads_path, exist_ok=True)
         
-        # Process the download
         with st.spinner("Processing download..."):
             file_path, status = download_youtube_video(video_url, downloads_path)
         
-        # Handle the result
         if file_path and os.path.exists(file_path):
             st.success(status)
-            
-            # Get file size in MB
             file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
             
-            # Create download button
             with open(file_path, "rb") as file:
                 st.download_button(
                     label=f"⬇️ Download Video ({file_size_mb:.1f}MB)",
@@ -181,7 +183,6 @@ def main():
             st.info(f"Video saved to: {file_path}")
         else:
             st.error(status)
-            st.info("Please verify the URL and try again.")
 
 if __name__ == "__main__":
     main()
