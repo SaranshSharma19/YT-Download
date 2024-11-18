@@ -83,12 +83,14 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
             status_text.text("Starting download...")
             ydl.download([video_url])
             
-            # Verify file exists and has size > 0
+            # Log file existence
+            logger.info(f"Checking file existence: {file_path}")
             if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
                 progress_bar.progress(1.0)
                 status_text.text("Download complete!")
                 return file_path, "Video downloaded successfully!"
             else:
+                logger.warning(f"File verification failed for: {file_path}")
                 return None, "Download completed but file verification failed."
 
     except yt_dlp.utils.DownloadError as e:
@@ -120,7 +122,7 @@ def main():
     
     if download_button:
         if video_url:
-            save_path = os.path.join(os.path.expanduser("~"), "Downloads")
+            save_path = '/tmp'  # Use temporary directory in Streamlit Cloud
             os.makedirs(save_path, exist_ok=True)
             
             with st.spinner("Processing download..."):
