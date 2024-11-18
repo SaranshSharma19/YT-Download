@@ -18,9 +18,12 @@ def download_youtube_video(video_url, save_path):
             'retries': 3,
             'fragment_retries': 5,
             'postprocessors': [{
-                'key': 'FFmpegMerger'  # Use FFmpegMerger without preferredcodec
-            }],
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'aac'  # Extract audio with AAC codec
+            }, {
+            'key': 'FFmpegMerger',
             'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()  # Provide ffmpeg executable path
+            }],
         }
         
         # Download the video
