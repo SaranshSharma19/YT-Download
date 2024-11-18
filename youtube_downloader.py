@@ -18,8 +18,7 @@ def download_youtube_video(video_url, save_path):
             'retries': 3,
             'fragment_retries': 5,
             'postprocessors': [{
-                'key': 'FFmpegMerger',  # Use FFmpegMerger to merge video and audio
-                'preferredcodec': 'mp4',  # Specify mp4 for compatibility
+                'key': 'FFmpegMerger'  # Use FFmpegMerger without preferredcodec
             }],
             'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()  # Provide ffmpeg executable path
         }
