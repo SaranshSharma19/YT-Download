@@ -15,21 +15,21 @@ def validate_url(url: str) -> bool:
     return "youtube.com" in url or "youtu.be" in url
 
 def get_safe_filename(title: str) -> str:
-    """Convert title to safe filename by removing invalid characters."""
+    """Convert title to a safe filename by removing invalid characters."""
     invalid_chars = '<>:"/\\|?*'
     filename = ''.join(char if char not in invalid_chars else '_' for char in title)
-    return filename[:200]  # Limit filename length
+    return filename[:200]  # Limit filename length to 200 characters
 
 def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str], str]:
     """
     Download YouTube video with enhanced error handling and progress tracking.
     
     Args:
-        video_url: YouTube video URL
-        save_path: Directory to save the downloaded video
+        video_url (str): YouTube video URL
+        save_path (str): Directory to save the downloaded video
         
     Returns:
-        Tuple of (file_path, status_message)
+        Tuple[Optional[str], str]: Tuple of (file_path, status_message)
     """
     try:
         if not validate_url(video_url):
@@ -39,11 +39,12 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
         status_text = st.empty()
         
         def progress_hook(d):
+            """Update progress bar and status text based on download progress."""
             if d['status'] == 'downloading':
                 try:
                     total = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
                     if total:
-                        progress = (d['downloaded_bytes'] / total)
+                        progress = d['downloaded_bytes'] / total
                         progress_bar.progress(progress)
                         status_text.text(f"Downloading: {progress:.1%}")
                 except Exception as e:
@@ -54,16 +55,9 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
             'merge_output_format': 'mp4',
             'outtmpl': os.path.join(save_path, '%(title)s.%(ext)s'),
             'quiet': True,
-            'no_warnings': False,
             'progress_hooks': [progress_hook],
             'retries': 5,
             'fragment_retries': 5,
-            'file_access_retries': 5,
-            'postprocessor_args': [
-                '-c:v', 'copy',
-                '-c:a', 'aac',  # Use AAC audio codec
-                '-strict', 'experimental'
-            ],
             'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()
         }
         
@@ -71,19 +65,19 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
             status_text.text("Extracting video information...")
             info = ydl.extract_info(video_url, download=False)
             
-            # Create safe filename
+            # Create a safe filename for the video
             video_title = get_safe_filename(info['title'])
             file_path = os.path.join(save_path, f"{video_title}.mp4")
             
-            # Check if file already exists
+            # Check if the file already exists
             if os.path.exists(file_path):
-                return file_path, "Video already exists in downloads folder."
+                return file_path, "Video already exists in the downloads folder."
             
-            # Download video
+            # Start the download
             status_text.text("Starting download...")
             ydl.download([video_url])
             
-            # Verify file exists and has size > 0
+            # Verify that the file exists and has a size greater than 0
             if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
                 progress_bar.progress(1.0)
                 status_text.text("Download complete!")
@@ -98,10 +92,8 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
         logger.error(f"Unexpected error: {e}", exc_info=True)
         return None, f"An unexpected error occurred: {str(e)}"
     finally:
-        if 'progress_bar' in locals():
-            progress_bar.empty()
-        if 'status_text' in locals():
-            status_text.empty()
+        progress_bar.empty()
+        status_text.empty()
 
 def main():
     st.set_page_config(page_title="YouTube Video Downloader", page_icon="▶️")
@@ -116,8 +108,8 @@ def main():
     
     col1, col2 = st.columns([1, 2])
     with col1:
-        download_button = st.button("Download Video", type="primary")
-    
+        download_button = st.button("Download Video")
+
     if download_button:
         if video_url:
             save_path = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -134,7 +126,6 @@ def main():
                         data=file,
                         file_name=os.path.basename(file_path),
                         mime="video/mp4",
-                        key="video_download"
                     )
                 st.info(f"Video also saved to: {file_path}")
             else:
