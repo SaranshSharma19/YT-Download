@@ -17,7 +17,6 @@ def download_youtube_video(video_url, save_path):
             'no_warnings': True,
             'retries': 3,
             'fragment_retries': 5,
-            'progress_hooks': [progress_hook],
             'ignoreerrors': False,
             'noprogress': False,
             'postprocessor_args': [
