@@ -6,37 +6,38 @@ import imageio_ffmpeg
 
 def download_youtube_video(video_url, save_path):
     try:
-        print(f"Downloading video from: {video_url}")
-
+        st.write(f"Downloading video from: {video_url}")
+        
+        # Define options for yt_dlp
         ydl_opts = {
             'format': 'bestvideo+bestaudio',
             'merge_output_format': 'mp4',
             'outtmpl': os.path.join(save_path, '%(title)s.%(ext)s'),
             'quiet': False,
             'no_warnings': True,
-            'concurrent-fragments': 5,
             'retries': 3,
-            'fragment-retries': 5,
-            'external-downloader': 'aria2c',
-            'external-downloader-args': ['-x', '16', '-s', '16', '-k', '1M'],
+            'fragment_retries': 5,
             'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4'  # Ensure the output is in a compatible format
+                'key': 'FFmpegMerger',  # Use FFmpegMerger to merge video and audio
+                'preferredcodec': 'mp4',  # Specify mp4 for compatibility
             }],
-            'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()
+            'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()  # Provide ffmpeg executable path
         }
+        
+        # Download the video
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            print("Downloading video...")
+            st.write("Downloading video...")
             info = ydl.extract_info(video_url, download=True)
             file_path = os.path.join(save_path, f"{info['title']}.mp4")
         
-        print('Video downloaded successfully!')
+        st.write('Video downloaded successfully!')
         return file_path, "Video downloaded successfully!"
         
     except Exception as e:
-        print(f"An error occurred: {e}")
+        st.write(f"An error occurred: {e}")
         return None, f"An error occurred: {e}"
 
+# Streamlit app UI
 st.title("YouTube Video Downloader")
 
 video_url = st.text_input("Enter YouTube video URL:")
@@ -44,6 +45,7 @@ video_url = st.text_input("Enter YouTube video URL:")
 if st.button("Download Video"):
     if video_url:
         save_path = os.path.join(os.path.expanduser("~"), "Downloads")
+        os.makedirs(save_path, exist_ok=True)
         file_path, status = download_youtube_video(video_url, save_path)
         
         if file_path:
