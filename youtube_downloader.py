@@ -21,7 +21,8 @@ def download_youtube_video(video_url, save_path):
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'aac'  # Extract audio with AAC codec
             }, {
-            'key': 'FFmpegMerger',
+                'key': 'FFmpegMerger',
+                'ffmpeg_location': '/usr/bin/ffmpeg'
             }],
         }
         
