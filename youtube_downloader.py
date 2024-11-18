@@ -19,6 +19,10 @@ def download_youtube_video(video_url, save_path):
             'fragment-retries': 5,
             'external-downloader': 'aria2c',
             'external-downloader-args': ['-x', '16', '-s', '16', '-k', '1M'],
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4'  # Ensure the output is in a compatible format
+            }],
             'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
