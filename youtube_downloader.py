@@ -4,174 +4,100 @@ import yt_dlp
 import os
 import imageio_ffmpeg
 import logging
-import tempfile
-from datetime import datetime
+from typing import Tuple, Optional
 
-# Set up detailed logging
-log_file = os.path.join(tempfile.gettempdir(), f'youtube_downloader_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler()
-    ]
-)
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def verify_ffmpeg():
-    """Verify FFmpeg installation and return its path."""
-    try:
-        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-        logger.info(f"FFmpeg found at: {ffmpeg_path}")
-        return ffmpeg_path
-    except Exception as e:
-        logger.error(f"FFmpeg verification failed: {e}")
-        return None
+def validate_url(url: str) -> bool:
+    """Validate if the URL is a valid YouTube URL."""
+    return "youtube.com" in url or "youtu.be" in url
 
-def check_disk_space(path):
-    """Check if there's enough disk space (at least 2GB free)."""
-    try:
-        total, used, free = os.statvfs(path)[0:6:2]
-        free_space = free * total
-        logger.info(f"Free disk space: {free_space / (1024**3):.2f} GB")
-        return free_space > (2 * 1024**3)  # 2GB minimum
-    except Exception as e:
-        logger.error(f"Disk space check failed: {e}")
-        return False
+def get_safe_filename(title: str) -> str:
+    """Convert title to safe filename by removing invalid characters."""
+    invalid_chars = '<>:"/\\|?*'
+    filename = ''.join(char if char not in invalid_chars else '_' for char in title)
+    return filename[:200]  # Limit filename length
 
-def download_youtube_video(video_url: str, save_path: str):
+def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str], str]:
     """
-    Download YouTube video with enhanced error handling and logging.
-    """
-    temp_dir = tempfile.mkdtemp()
-    logger.info(f"Created temporary directory: {temp_dir}")
+    Download YouTube video with enhanced error handling and progress tracking.
     
-    try:
-        # System checks
-        if not verify_ffmpeg():
-            return None, "FFmpeg not found or not working properly."
+    Args:
+        video_url: YouTube video URL
+        save_path: Directory to save the downloaded video
         
-        if not check_disk_space(save_path):
-            return None, "Insufficient disk space (minimum 2GB required)."
+    Returns:
+        Tuple of (file_path, status_message)
+    """
+    try:
+        if not validate_url(video_url):
+            return None, "Invalid YouTube URL. Please check the URL and try again."
 
         progress_bar = st.progress(0)
         status_text = st.empty()
-        download_info = {"started": False, "complete": False, "progress": 0}
-
+        
         def progress_hook(d):
             if d['status'] == 'downloading':
-                download_info["started"] = True
                 try:
                     total = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
-                    downloaded = d.get('downloaded_bytes', 0)
-                    if total > 0:
-                        progress = downloaded / total
-                        download_info["progress"] = progress
+                    if total:
+                        progress = (d['downloaded_bytes'] / total)
                         progress_bar.progress(progress)
-                        status_text.text(f"Downloading: {progress:.1%} ({downloaded}/{total} bytes)")
-                        logger.debug(f"Download progress: {progress:.1%}")
+                        status_text.text(f"Downloading: {progress:.1%}")
                 except Exception as e:
                     logger.warning(f"Progress calculation error: {e}")
-            elif d['status'] == 'finished':
-                download_info["complete"] = True
-                logger.info("Download finished, starting merge process")
-                status_text.text("Processing video...")
 
         ydl_opts = {
-            'format': 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Prefer MP4 format
             'merge_output_format': 'mp4',
-            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-            'verbose': True,
+            'outtmpl': os.path.join(save_path, '%(title)s.%(ext)s'),
+            'quiet': True,
+            'no_warnings': False,
             'progress_hooks': [progress_hook],
-            'retries': 10,
-            'fragment_retries': 10,
-            'file_access_retries': 10,
+            'retries': 5,
+            'fragment_retries': 5,
+            'file_access_retries': 5,
             'postprocessor_args': [
                 '-c:v', 'copy',
-                '-c:a', 'aac',
-                '-strict', 'experimental',
-                '-movflags', '+faststart'
+                '-c:a', 'aac',  # Use AAC audio codec
+                '-strict', 'experimental'
             ],
-            'ffmpeg_location': verify_ffmpeg()
+            'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()
         }
-
-        logger.info("Starting download with options: %s", str(ydl_opts))
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             status_text.text("Extracting video information...")
-            logger.info("Extracting video information from URL: %s", video_url)
-            
             info = ydl.extract_info(video_url, download=False)
-            safe_title = "".join(x for x in info['title'] if x.isalnum() or x in (' ', '-', '_')).rstrip()
-            temp_file_path = os.path.join(temp_dir, f"{safe_title}.mp4")
-            final_file_path = os.path.join(save_path, f"{safe_title}.mp4")
             
-            logger.info(f"Temporary file path: {temp_file_path}")
-            logger.info(f"Final file path: {final_file_path}")
+            # Create safe filename
+            video_title = get_safe_filename(info['title'])
+            file_path = os.path.join(save_path, f"{video_title}.mp4")
+            
+            # Check if file already exists
+            if os.path.exists(file_path):
+                return file_path, "Video already exists in downloads folder."
             
             # Download video
-            logger.info("Starting video download")
+            status_text.text("Starting download...")
             ydl.download([video_url])
             
-            if not download_info["started"]:
-                logger.error("Download never started")
-                return None, "Download failed to start"
-            
-            if not download_info["complete"]:
-                logger.error("Download never completed")
-                return None, "Download was interrupted"
-
-            # Verify temporary file
-            if not os.path.exists(temp_file_path):
-                logger.error(f"Temporary file not found: {temp_file_path}")
-                return None, "Download failed - temporary file not found"
-            
-            temp_size = os.path.getsize(temp_file_path)
-            logger.info(f"Temporary file size: {temp_size} bytes")
-            
-            if temp_size == 0:
-                logger.error("Downloaded file is empty")
-                return None, "Download failed - file is empty"
-
-            # Move file to final location
-            try:
-                os.replace(temp_file_path, final_file_path)
-                logger.info(f"Successfully moved file to: {final_file_path}")
-                
-                final_size = os.path.getsize(final_file_path)
-                logger.info(f"Final file size: {final_size} bytes")
-                
-                if final_size > 0:
-                    return final_file_path, "Video downloaded successfully!"
-                else:
-                    logger.error("Final file is empty")
-                    return None, "Download failed - final file is empty"
-                    
-            except Exception as e:
-                logger.error(f"Error moving file: {e}")
-                return None, f"Error saving file: {str(e)}"
+            # Verify file exists and has size > 0
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                progress_bar.progress(1.0)
+                status_text.text("Download complete!")
+                return file_path, "Video downloaded successfully!"
+            else:
+                return None, "Download completed but file verification failed."
 
     except yt_dlp.utils.DownloadError as e:
-        logger.error(f"YouTube-DL download error: {e}")
+        logger.error(f"Download error: {e}")
         return None, f"Download failed: {str(e)}"
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         return None, f"An unexpected error occurred: {str(e)}"
     finally:
-        # Cleanup
-        try:
-            if os.path.exists(temp_dir):
-                for file in os.listdir(temp_dir):
-                    try:
-                        os.remove(os.path.join(temp_dir, file))
-                    except Exception as e:
-                        logger.warning(f"Failed to remove temporary file {file}: {e}")
-                os.rmdir(temp_dir)
-                logger.info("Cleaned up temporary directory")
-        except Exception as e:
-            logger.warning(f"Failed to clean up temporary directory: {e}")
-        
         if 'progress_bar' in locals():
             progress_bar.empty()
         if 'status_text' in locals():
@@ -185,10 +111,6 @@ def main():
     Download YouTube videos in highest quality MP4 format.
     Please ensure you have the right to download the video content.
     """)
-
-    # Display log file location
-    st.sidebar.text("Debug Information")
-    st.sidebar.text(f"Log file location:\n{log_file}")
 
     video_url = st.text_input("Enter YouTube video URL:", placeholder="https://youtube.com/watch?v=...")
     
@@ -214,10 +136,9 @@ def main():
                         mime="video/mp4",
                         key="video_download"
                     )
-                st.info(f"Video saved to: {file_path}")
+                st.info(f"Video also saved to: {file_path}")
             else:
                 st.error(status)
-                st.error("Check the log file for detailed error information.")
         else:
             st.error("Please enter a valid YouTube URL.")
 
