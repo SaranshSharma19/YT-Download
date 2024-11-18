@@ -17,50 +17,6 @@ def check_ffmpeg():
     except FileNotFoundError:
         return False
 
-def get_installation_instructions():
-    """Get FFmpeg installation instructions based on OS."""
-    system = platform.system().lower()
-    
-    if system == 'windows':
-        return """
-        To install FFmpeg on Windows:
-        1. Download FFmpeg from https://www.gyan.dev/ffmpeg/builds/
-        2. Extract the zip file
-        3. Add the bin folder to your System PATH
-        
-        Alternatively, use the command:
-        ```
-        winget install FFmpeg
-        ```
-        """
-    elif system == 'darwin':  # macOS
-        return """
-        To install FFmpeg on macOS:
-        1. Install Homebrew if not installed:
-           ```
-           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-           ```
-        2. Install FFmpeg:
-           ```
-           brew install ffmpeg
-           ```
-        """
-    else:  # Linux
-        return """
-        To install FFmpeg on Linux:
-        
-        Ubuntu/Debian:
-        ```
-        sudo apt update
-        sudo apt install ffmpeg
-        ```
-        
-        Fedora:
-        ```
-        sudo dnf install ffmpeg
-        ```
-        """
-
 def download_youtube_video(video_url: str, save_path: str):
     """Download YouTube video with FFmpeg check."""
     if not check_ffmpeg():
@@ -139,7 +95,6 @@ def main():
     if not check_ffmpeg():
         st.error("⚠️ FFmpeg is not installed!")
         st.markdown("### FFmpeg Installation Instructions")
-        st.code(get_installation_instructions())
         st.warning("After installing FFmpeg, please restart this application.")
         return
 
