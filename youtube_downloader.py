@@ -123,7 +123,7 @@ def main():
     if download_button:
         if video_url:
             save_path = os.path.join(os.path.expanduser("~"), "Downloads")  # Use temporary directory in Streamlit Cloud
-            os.makedirs(save_path, exist_ok=True)
+            os.makedirs(save_path, exist_ok=False)
             
             with st.spinner("Processing download..."):
                 file_path, status = download_youtube_video(video_url, save_path)
