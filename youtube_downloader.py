@@ -1,8 +1,6 @@
 from pathlib import Path
-import streamlit as st
 import yt_dlp
 import os
-import imageio_ffmpeg
 import logging
 from typing import Tuple, Optional
 
@@ -35,69 +33,48 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
         if not validate_url(video_url):
             return None, "Invalid YouTube URL. Please check the URL and try again."
 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        # Check save path permissions
+        if not os.access(save_path, os.W_OK):
+            return None, f"Permission error: Cannot write to directory {save_path}"
         
-        def progress_hook(d):
-            """Update progress bar and status text based on download progress."""
-            if d['status'] == 'downloading':
-                try:
-                    total = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
-                    if total:
-                        progress = d['downloaded_bytes'] / total
-                        progress_bar.progress(progress)
-                        status_text.text(f"Downloading: {progress:.1%}")
-                except Exception as e:
-                    logger.warning(f"Progress calculation error: {e}")
-            elif d['status'] == 'finished':
-                progress_bar.progress(1.0)
-                status_text.text("Download complete!")
-
         ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Prefer MP4 format
+            'format': 'best',  # Simplified format setting
             'merge_output_format': 'mp4',
             'outtmpl': str(Path(save_path) / '%(title)s.%(ext)s'),
-            'quiet': True,
-            'progress_hooks': [progress_hook],
             'retries': 5,
-            'fragment_retries': 5,
             'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe(),
-            'nocheckcertificate': True  # Added to bypass SSL issues
+            'nocheckcertificate': True,
+            'verbose': True  # Enable detailed yt-dlp output for debugging
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # Clear yt-dlp cache to prevent stale data issues
             ydl.cache.remove()
             
-            status_text.text("Extracting video information...")
+            logger.info("Extracting video information...")
             info = ydl.extract_info(video_url, download=False)
             
             # Create a safe filename for the video
             video_title = get_safe_filename(info['title'])
             file_path = Path(save_path) / f"{video_title}.mp4"
             
-            # Check if the file already exists
+            # Check if file already exists
             if file_path.exists():
-                return str(file_path), "Video already exists in the downloads folder."
+                return str(file_path), "Video already exists in downloads folder."
             
             # Start the download
-            status_text.text("Starting download...")
+            logger.info("Starting download...")
             ydl.download([video_url])
             
-            # Check if file exists and has a size greater than 0
-            downloaded_files = list(Path(save_path).glob(f"{video_title}.*"))
-            if downloaded_files:
-                actual_file_path = downloaded_files[0]
-                if actual_file_path.exists() and actual_file_path.stat().st_size > 0:
-                    logger.info(f"Downloaded file path: {actual_file_path}")
-                    logger.info(f"File size: {actual_file_path.stat().st_size} bytes")
-                    progress_bar.progress(1.0)
-                    status_text.text("Download complete!")
-                    return str(actual_file_path), "Video downloaded successfully!"
-                else:
-                    return None, "Download completed, but file verification failed."
+            # Verify the file exists after download
+            downloaded_files = list(Path(save_path).glob("*.*"))
+            logger.info(f"Files in directory after download: {[str(file) for file in downloaded_files]}")
+            if file_path.exists() and file_path.stat().st_size > 0:
+                logger.info(f"Downloaded file path: {file_path}")
+                logger.info(f"File size: {file_path.stat().st_size} bytes")
+                return str(file_path), "Video downloaded successfully!"
             else:
-                return None, "No downloaded file was found after completion."
+                return None, "Download completed, but file verification failed."
 
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download error: {e}")
@@ -105,47 +82,13 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         return None, f"An unexpected error occurred: {str(e)}"
-    finally:
-        progress_bar.empty()
-        status_text.empty()
 
-def main():
-    st.set_page_config(page_title="YouTube Video Downloader", page_icon="▶️")
-    
-    st.title("▶️ YouTube Video Downloader")
-    st.markdown("""
-    Download YouTube videos in highest quality MP4 format.
-    Please ensure you have the right to download the video content.
-    """)
-
-    video_url = st.text_input("Enter YouTube video URL:", placeholder="https://youtube.com/watch?v=...")
-    
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        download_button = st.button("Download Video")
-
-    if download_button:
-        if video_url:
-            save_path = os.path.join(os.path.expanduser("~"), "Downloads")
-            os.makedirs(save_path, exist_ok=True)
-            
-            with st.spinner("Processing download..."):
-                file_path, status = download_youtube_video(video_url, save_path)
-            
-            if file_path and os.path.exists(file_path):
-                st.success(status)
-                with open(file_path, "rb") as file:
-                    st.download_button(
-                        label="⬇️ Download Video",
-                        data=file,
-                        file_name=os.path.basename(file_path),
-                        mime="video/mp4",
-                    )
-                st.info(f"Video also saved to: {file_path}")
-            else:
-                st.error(status)
-        else:
-            st.error("Please enter a valid YouTube URL.")
-
+# Test download outside Streamlit
 if __name__ == "__main__":
-    main()
+    url = input("Enter YouTube URL to download: ")
+    save_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+    os.makedirs(save_dir, exist_ok=True)
+    file_path, status = download_youtube_video(url, save_dir)
+    print(status)
+    if file_path:
+        print(f"File downloaded to: {file_path}")
