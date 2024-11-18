@@ -49,41 +49,55 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
                         status_text.text(f"Downloading: {progress:.1%}")
                 except Exception as e:
                     logger.warning(f"Progress calculation error: {e}")
+            elif d['status'] == 'finished':
+                progress_bar.progress(1.0)
+                status_text.text("Download complete!")
 
         ydl_opts = {
             'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Prefer MP4 format
             'merge_output_format': 'mp4',
-            'outtmpl': os.path.join(save_path, '%(title)s.%(ext)s'),
+            'outtmpl': str(Path(save_path) / '%(title)s.%(ext)s'),
             'quiet': True,
             'progress_hooks': [progress_hook],
             'retries': 5,
             'fragment_retries': 5,
-            'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()
+            'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe(),
+            'nocheckcertificate': True  # Added to bypass SSL issues
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Clear yt-dlp cache to prevent stale data issues
+            ydl.cache.remove()
+            
             status_text.text("Extracting video information...")
             info = ydl.extract_info(video_url, download=False)
             
             # Create a safe filename for the video
             video_title = get_safe_filename(info['title'])
-            file_path = os.path.join(save_path, f"{video_title}.mp4")
+            file_path = Path(save_path) / f"{video_title}.mp4"
             
             # Check if the file already exists
-            if os.path.exists(file_path):
-                return file_path, "Video already exists in the downloads folder."
+            if file_path.exists():
+                return str(file_path), "Video already exists in the downloads folder."
             
             # Start the download
             status_text.text("Starting download...")
             ydl.download([video_url])
             
-            # Verify that the file exists and has a size greater than 0
-            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                progress_bar.progress(1.0)
-                status_text.text("Download complete!")
-                return file_path, "Video downloaded successfully!"
+            # Check if file exists and has a size greater than 0
+            downloaded_files = list(Path(save_path).glob(f"{video_title}.*"))
+            if downloaded_files:
+                actual_file_path = downloaded_files[0]
+                if actual_file_path.exists() and actual_file_path.stat().st_size > 0:
+                    logger.info(f"Downloaded file path: {actual_file_path}")
+                    logger.info(f"File size: {actual_file_path.stat().st_size} bytes")
+                    progress_bar.progress(1.0)
+                    status_text.text("Download complete!")
+                    return str(actual_file_path), "Video downloaded successfully!"
+                else:
+                    return None, "Download completed, but file verification failed."
             else:
-                return None, "Download completed but file verification failed."
+                return None, "No downloaded file was found after completion."
 
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download error: {e}")
