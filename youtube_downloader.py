@@ -17,13 +17,24 @@ def download_youtube_video(video_url, save_path):
             'no_warnings': True,
             'retries': 3,
             'fragment_retries': 5,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'aac'  # Extract audio with AAC codec
-            }, {
-                'key': 'FFmpegMerger',
-                'ffmpeg_location': '/usr/bin/ffmpeg'
-            }],
+            ydl_opts = {
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'merge_output_format': 'mp4',
+            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+            'progress_hooks': [progress_hook],
+            'retries': 5,
+            'fragment_retries': 5,
+            'ignoreerrors': False,
+            'no_warnings': True,
+            'quiet': True,
+            'noprogress': False,
+            'postprocessor_args': [
+                '-c:v', 'copy',
+                '-c:a', 'aac',
+                '-strict', 'experimental'
+            ]
+        }
+
         }
         
         # Download the video
