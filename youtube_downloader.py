@@ -4,37 +4,27 @@ import yt_dlp
 import os
 import imageio_ffmpeg
 import logging
-from typing import Tuple, Optional
+from datetime import datetime
+import random
+import time
 
-# Set up logging
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def validate_url(url: str) -> bool:
-    """Validate if the URL is a valid YouTube URL."""
-    return "youtube.com" in url or "youtu.be" in url
+def get_user_agent():
+    """Return a random modern user agent."""
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+    ]
+    return random.choice(user_agents)
 
-def get_safe_filename(title: str) -> str:
-    """Convert title to safe filename by removing invalid characters."""
-    invalid_chars = '<>:"/\\|?*'
-    filename = ''.join(char if char not in invalid_chars else '_' for char in title)
-    return filename[:200]  # Limit filename length
-
-def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str], str]:
-    """
-    Download YouTube video with enhanced error handling and progress tracking.
-    
-    Args:
-        video_url: YouTube video URL
-        save_path: Directory to save the downloaded video
-        
-    Returns:
-        Tuple of (file_path, status_message)
-    """
+def download_youtube_video(video_url: str, save_path: str):
+    """Download YouTube video with enhanced security handling."""
     try:
-        if not validate_url(video_url):
-            return None, "Invalid YouTube URL. Please check the URL and try again."
-
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -42,61 +32,88 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
             if d['status'] == 'downloading':
                 try:
                     total = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
-                    if total:
-                        progress = (d['downloaded_bytes'] / total)
+                    downloaded = d.get('downloaded_bytes', 0)
+                    if total > 0:
+                        progress = downloaded / total
                         progress_bar.progress(progress)
                         status_text.text(f"Downloading: {progress:.1%}")
-                except Exception as e:
-                    logger.warning(f"Progress calculation error: {e}")
+                except:
+                    pass
+            elif d['status'] == 'finished':
+                status_text.text("Processing video...")
 
+        # Enhanced options to avoid 403 errors
         ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Prefer MP4 format
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
             'merge_output_format': 'mp4',
             'outtmpl': os.path.join(save_path, '%(title)s.%(ext)s'),
-            'quiet': True,
-            'no_warnings': False,
             'progress_hooks': [progress_hook],
-            'retries': 5,
-            'fragment_retries': 5,
-            'file_access_retries': 5,
+            'retries': 3,
+            'fragment_retries': 3,
+            'ignoreerrors': True,
+            'no_warnings': True,
+            'quiet': True,
+            'nocheckcertificate': True,
+            'http_chunk_size': 10485760,  # 10MB chunks
+            'user_agent': get_user_agent(),
+            'headers': {
+                'Referer': 'https://www.youtube.com/',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+            },
             'postprocessor_args': [
                 '-c:v', 'copy',
-                '-c:a', 'aac',  # Use AAC audio codec
+                '-c:a', 'aac',
                 '-strict', 'experimental'
             ],
             'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()
         }
+
+        status_text.text("Preparing download...")
+        
+        # Add a small delay to avoid rate limiting
+        time.sleep(1)
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            status_text.text("Extracting video information...")
-            info = ydl.extract_info(video_url, download=False)
+            # First get video info without downloading
+            try:
+                info = ydl.extract_info(video_url, download=False)
+                if info is None:
+                    return None, "Could not retrieve video information. Please check the URL."
+                
+                video_title = info.get('title', 'video')
+                safe_title = "".join(x for x in video_title if x.isalnum() or x in (' ', '-', '_')).rstrip()
+                file_path = os.path.join(save_path, f"{safe_title}.mp4")
+                
+                # Download the video
+                status_text.text("Starting download...")
+                ydl.download([video_url])
+                
+                # Verify download
+                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                    progress_bar.progress(1.0)
+                    status_text.text("Download complete!")
+                    return file_path, "Video downloaded successfully!"
+                else:
+                    alt_file_path = os.path.join(save_path, f"{safe_title}.mkv")
+                    if os.path.exists(alt_file_path) and os.path.getsize(alt_file_path) > 0:
+                        return alt_file_path, "Video downloaded successfully!"
+                    return None, "Download completed but file not found. Please try again."
+                    
+            except yt_dlp.utils.DownloadError as e:
+                if "HTTP Error 403" in str(e):
+                    logger.error("403 error encountered, retrying with alternate options...")
+                    # Try alternate download method
+                    ydl_opts['format'] = 'best'  # Simplify format selection
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                        ydl2.download([video_url])
+                        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                            return file_path, "Video downloaded successfully!"
+                return None, "Could not access video. Please verify the URL and try again."
             
-            # Create safe filename
-            video_title = get_safe_filename(info['title'])
-            file_path = os.path.join(save_path, f"{video_title}.mp4")
-            
-            # Check if file already exists
-            if os.path.exists(file_path):
-                return file_path, "Video already exists in downloads folder."
-            
-            # Download video
-            status_text.text("Starting download...")
-            ydl.download([video_url])
-            
-            # Verify file exists and has size > 0
-            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                progress_bar.progress(1.0)
-                status_text.text("Download complete!")
-                return file_path, "Video downloaded successfully!"
-            else:
-                return None, "Download completed but file verification failed."
-
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"Download error: {e}")
-        return None, f"Download failed: {str(e)}"
     except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        return None, f"An unexpected error occurred: {str(e)}"
+        logger.error(f"Error during download: {str(e)}")
+        return None, f"Download error: {str(e)}"
     finally:
         if 'progress_bar' in locals():
             progress_bar.empty()
@@ -104,7 +121,11 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
             status_text.empty()
 
 def main():
-    st.set_page_config(page_title="YouTube Video Downloader", page_icon="▶️")
+    st.set_page_config(
+        page_title="YouTube Video Downloader",
+        page_icon="▶️",
+        initial_sidebar_state="collapsed"
+    )
     
     st.title("▶️ YouTube Video Downloader")
     st.markdown("""
@@ -112,14 +133,17 @@ def main():
     Please ensure you have the right to download the video content.
     """)
 
-    video_url = st.text_input("Enter YouTube video URL:", placeholder="https://youtube.com/watch?v=...")
+    video_url = st.text_input(
+        "Enter YouTube video URL:",
+        placeholder="https://youtube.com/watch?v=..."
+    )
     
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        download_button = st.button("Download Video", type="primary")
-    
-    if download_button:
+    if st.button("Download Video", type="primary"):
         if video_url:
+            if not ("youtube.com" in video_url or "youtu.be" in video_url):
+                st.error("Please enter a valid YouTube URL.")
+                return
+                
             save_path = os.path.join(os.path.expanduser("~"), "Downloads")
             os.makedirs(save_path, exist_ok=True)
             
@@ -136,11 +160,11 @@ def main():
                         mime="video/mp4",
                         key="video_download"
                     )
-                st.info(f"Video also saved to: {file_path}")
+                st.info(f"Video saved to: {file_path}")
             else:
                 st.error(status)
         else:
-            st.error("Please enter a valid YouTube URL.")
+            st.error("Please enter a YouTube URL.")
 
 if __name__ == "__main__":
     main()
