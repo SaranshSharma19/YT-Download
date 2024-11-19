@@ -136,11 +136,7 @@ def main():
 
     video_url = st.text_input("Enter YouTube video URL:", placeholder="https://youtube.com/watch?v=...")
     
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        download_button = st.button("Download Video", type="primary")
-    
-    if download_button:
+    if st.button("Download Video", type="primary"):
         if video_url:
             save_path = os.path.join(os.path.expanduser("~"), "Downloads")
             os.makedirs(save_path, exist_ok=True)
@@ -149,16 +145,7 @@ def main():
                 file_path, status = download_youtube_video(video_url, save_path)
             
             if file_path and os.path.exists(file_path):
-                st.success(status)
-                with open(file_path, "rb") as file:
-                    st.download_button(
-                        label="⬇️ Download Video",
-                        data=file,
-                        file_name=os.path.basename(file_path),
-                        mime="video/mp4",
-                        key="video_download"
-                    )
-                st.info(f"Video also saved to: {file_path}")
+                st.success(f"Video downloaded successfully! Saved to: {file_path}")
             else:
                 st.error(status)
         else:
