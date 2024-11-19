@@ -50,7 +50,7 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
                     logger.warning(f"Progress calculation error: {e}")
 
         ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Prefer MP4 format
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
             'merge_output_format': 'mp4',
             'outtmpl': os.path.join(save_path, '%(title)s.%(ext)s'),
             'quiet': True,
@@ -61,56 +61,30 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
             'file_access_retries': 5,
             'postprocessor_args': [
                 '-c:v', 'copy',
-                '-c:a', 'aac',  # Use AAC audio codec
+                '-c:a', 'aac',
                 '-strict', 'experimental'
             ],
-            'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()
+            'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe(),
+            'overwrites': True,
+            'no_part': True
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             status_text.text("Extracting video information...")
             info = ydl.extract_info(video_url, download=False)
-            
-            # Create safe filename and get the full path before download
             video_title = get_safe_filename(info['title'])
-            expected_file_path = os.path.join(save_path, f"{video_title}.mp4")
-            
-            logger.info(f"Expected file path: {expected_file_path}")
-            
-            # Check if file already exists
-            if os.path.exists(expected_file_path):
-                logger.info(f"File already exists at: {expected_file_path}")
-                return expected_file_path, "Video already exists in downloads folder."
             
             # Download video
             status_text.text("Starting download...")
-            download_info = ydl.extract_info(video_url, download=True)
+            ydl.download([video_url])
             
-            # Get the actual filename from yt-dlp's info
-            if 'requested_downloads' in download_info:
-                for download in download_info['requested_downloads']:
-                    actual_file_path = download.get('filepath', '')
-                    logger.info(f"yt-dlp reported filepath: {actual_file_path}")
-                    if actual_file_path and os.path.exists(actual_file_path):
-                        if os.path.getsize(actual_file_path) > 0:
-                            progress_bar.progress(1.0)
-                            status_text.text("Download complete!")
-                            return actual_file_path, "Video downloaded successfully!"
+            # Look for the final MP4 file
+            expected_file_path = os.path.join(save_path, f"{video_title}.mp4")
+            if os.path.exists(expected_file_path) and os.path.getsize(expected_file_path) > 0:
+                progress_bar.progress(1.0)
+                status_text.text("Download complete!")
+                return expected_file_path, "Video downloaded successfully!"
             
-            # Fallback: Look for the file in the save directory
-            logger.info(f"Searching for files in: {save_path}")
-            for file in os.listdir(save_path):
-                logger.info(f"Found file: {file}")
-                if file.startswith(video_title) and file.endswith('.mp4'):
-                    actual_file_path = os.path.join(save_path, file)
-                    file_size = os.path.getsize(actual_file_path)
-                    logger.info(f"Matching file found: {actual_file_path} (size: {file_size} bytes)")
-                    if file_size > 0:
-                        progress_bar.progress(1.0)
-                        status_text.text("Download complete!")
-                        return actual_file_path, "Video downloaded successfully!"
-            
-            logger.error(f"File not found after download. Save path contents: {os.listdir(save_path)}")
             return None, "Download completed but file not found in the expected location."
 
     except yt_dlp.utils.DownloadError as e:
