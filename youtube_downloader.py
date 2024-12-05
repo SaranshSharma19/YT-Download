@@ -51,7 +51,7 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
 
         ydl_opts = {
             # 'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', 
-            'format': 'worstvideo[height<=144][ext=mp4]+bestaudio[ext=m4a]/best[height<=144][ext=mp4]',
+            'format': 'worstvideo[height<=144][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]',
             'outtmpl': os.path.join(save_path, '%(title)s.%(ext)s'),
             'quiet': True,
             'no_warnings': False,
