@@ -50,7 +50,8 @@ def download_youtube_video(video_url: str, save_path: str) -> Tuple[Optional[str
                     logger.warning(f"Progress calculation error: {e}")
 
         ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Prefer MP4 format
+            # 'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', 
+            'format': 'best', # Prefer MP4 format
             'merge_output_format': 'mp4',
             'outtmpl': os.path.join(save_path, '%(title)s.%(ext)s'),
             'quiet': True,
