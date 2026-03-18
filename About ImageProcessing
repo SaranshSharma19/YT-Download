@@ -1,0 +1,70 @@
+
+This script is a complex automation tool designed for extracting, processing, and uploading specific segments of a YouTube video to social media platforms like Instagram (as reels) and YouTube (as shorts). Below is an explanation of its key features and workflow:
+
+Key Features
+Downloading Full YouTube Video:
+
+The script uses yt_dlp to download a YouTube video in the best available format. It saves the downloaded file temporarily for further processing.
+Extracting the Most Replayed Segments:
+
+It analyzes YouTube's heatmap data (a feature visible for some videos showing the most replayed parts) by parsing the video’s web page HTML.
+It identifies the segments with the highest replay intensity and merges overlapping segments.
+Segment Processing:
+
+For each identified segment:
+Extracts: Clips the video to the specific segment.
+Subtitles:
+Uses the Whisper library for speech recognition to generate subtitles (in SRT format).
+Adds subtitles directly onto the video.
+Resizing:
+Resizes the video to match Instagram Reels (9:16) or YouTube Shorts specifications.
+Uploading:
+
+Instagram:
+Automates uploading via the instabot library.
+Includes a caption with part of the transcript and other metadata.
+YouTube:
+Uses the Google API to upload as a YouTube Short.
+Includes a description with a transcript snippet and original video link.
+Rate Limiting:
+
+Implements daily upload limits and delays between consecutive uploads to avoid hitting platform restrictions.
+Retries:
+
+Uses retry mechanisms with exponential backoff to handle temporary issues during video downloads or API uploads.
+Cleanup:
+
+Removes temporary files after processing to conserve storage space.
+Workflow
+Initialization:
+
+The user provides a YouTube video URL and an output directory for processed videos.
+Get Most Replayed Segments:
+
+It fetches the heatmap data from the YouTube page to identify the most popular segments of the video.
+Download and Process:
+
+The full video is downloaded only once.
+Each segment is processed:
+Subclips are created for the identified segments.
+Subtitles are generated and added.
+Videos are resized for Instagram and YouTube.
+Upload:
+
+The processed videos are uploaded to Instagram and YouTube with captions/descriptions.
+Cleanup:
+
+Temporary files are removed to keep the system clean.
+Use Case
+This script is ideal for:
+
+Content creators who want to repurpose popular parts of their YouTube videos for social media platforms.
+Automating workflows for uploading content with minimal manual intervention.
+Ensuring videos are optimized for different platforms with proper subtitles and formatting.
+Improvements/Customization
+Credentials:
+Replace placeholder credentials (client_secrets.json, Instagram login details) with actual values.
+Error Handling:
+Extend handling for edge cases (e.g., unavailable heatmap data).
+Customization:
+Allow customization of captions, descriptions, and upload limits.
