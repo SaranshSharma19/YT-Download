@@ -1,1 +1,75 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# === Virtual Environments ===
 imagpros/
+venv/
+env/
+.venv/
+
+# === Environment & Secrets ===
+.env
+client_secrets.json
+*.json
+!package.json
+
+# === Trading State & Databases ===
+trading_state.json
+*.db
+*.db-journal
+
+# === Log Files ===
+*.log
+
+# === Model Files (large binaries) ===
+models/
+*.joblib
+*.pkl
+*.h5
+*.pt
+*.pth
+
+# === Cache ===
+.trading_cache/
+.cache/
+*.cache
+
+# === Media & Large Files ===
+*.mp3
+*.mp4
+*.m4a
+*.wav
+*.part
+*.webm
+
+# === Documents & Reports ===
+*.md
+*.pdf
+*.txt
+!requirements.txt
+
+# === OS & Editor ===
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# === Jupyter ===
+.ipynb_checkpoints/
+*.ipynb
+
+# === Analysis & Temp ===
+*.json
+today_trades_analysis.json
+DATA_FETCH_ERRORS_TODAY.md
+TENSORFLOW_INSTALLED_SUCCESS.md

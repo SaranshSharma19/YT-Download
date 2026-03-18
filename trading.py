@@ -89,6 +89,15 @@ except ImportError as e:
     TradingViewValidator = None
     SignalValidator = None
 
+try:
+    from expiry_utils import is_expiry_day, is_expiry_week, get_expiry_adjustment
+    from enhanced_features import add_enhanced_features
+    from improved_targets import calculate_improved_targets
+except ImportError as e:
+    print(f"Warning: Supplemental ML modules not fully available: {e}. Some features disabled.")
+    is_expiry_day = is_expiry_week = get_expiry_adjustment = None
+    add_enhanced_features = calculate_improved_targets = None
+
 # ================== State Management ==================
 class TradingState:
     """
@@ -203,7 +212,7 @@ class Config:
     MARKET_END = "15:30"
 
     # Model Configuration
-    CONFIDENCE_THRESHOLD = 0.52
+    CONFIDENCE_THRESHOLD = 0.51 # Lowered from 0.52
     FORCE_RETRAIN = False  # Set to True to force model retraining
     MIN_VOLUME_RATIO = 0.5   # Minimum volume ratio vs 20-day MA for signal consideration
     LOOKBACK_WINDOWS = [5, 10, 20, 50, 100] # Intraday-friendly windows (bars)
@@ -215,7 +224,6 @@ class Config:
     RETRAIN_ON_FEATURE_MISMATCH = False  # If True, retrain when saved model expects features not present
 
     # Signal/logic parameters
-    FORCE_RETRAIN = True          # Retrain models on startup (set to False after successful run)
 
     USE_EOD_SIGNALS = False         # If True, only act on closed daily candles (after market close)
     AGREEMENT_STD_MAX = 0.35        # Max std dev of base model probabilities to consider consensus (more relaxed)
@@ -229,7 +237,7 @@ class Config:
     ENABLE_VWAP_CONFIRMATION = True
     ENABLE_MACD_CONFIRMATION = True
     USE_BAR_CLOSE_ONLY = True       # Only act on closed bars (for 15m intraday)
-    COOLDOWN_BARS = 1               # Avoid multiple signals on same/new bar
+    COOLDOWN_BARS = 3               # Avoid multiple signals on same/new bar
 
 
     # Data fetching parameters
@@ -239,9 +247,17 @@ class Config:
     INTERVAL = "5m"
     DATA_PERIOD_TRAINING = "60d"   # For 5m, Yahoo supports ~60 days max
     DATA_PERIOD_SIGNAL = "30d"     # Signals use recent window to stay fast
-    CACHE_FRESHNESS_SECONDS = 300 # 5 minutes
+    CACHE_FRESHNESS_SECONDS = 120 # Adjusted from 60s to 120s for realism
     MAX_FETCH_RETRIES = 5         # Retries for data fetching
-    POLL_INTERVAL = 300           # Seconds to wait between cycles
+    POLL_INTERVAL = 120           # Adjusted from 60s to 120s for realism
+    MONITOR_INTERVAL = 15         # Seconds between FAST position-only checks
+    EMERGENCY_SL_MULTIPLIER = 1.5 # If price exceeds SL by 1.5× risk, treat as emergency
+    TRANSACTION_COST_PER_LOT = 150  # Estimated round-trip cost per lot (brokerage + STT + exchange)
+    
+    # ML Model Configuration
+    TARGET_MODE = 'three_class'   # 'binary' or 'three_class'
+    USE_ENHANCED_FEATURES = True
+    SELECTED_FEATURES_ONLY = True  # Prune noise by using only high-impact features
     
     # ===== NEW: Enhanced Features Configuration =====
     # Risk Management
@@ -298,14 +314,22 @@ class EnhancedDataFetcher:
             )
             if not df.empty:
                 df.index = pd.to_datetime(df.index)
-                # Ensure standard column names and drop potential multi-index
-                df.columns = [col.replace(' ', '_') for col in df.columns]
+                
+                # Robustly flatten yfinance multi-index (often seen with index tickers)
                 if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.droplevel(1)
+                    # Level 0 is typically Price type (Close, High, etc.), Level 1 is Ticker
+                    df.columns = df.columns.get_level_values(0)
+                
+                # Standardize column names (remove spaces)
+                df.columns = [str(col).replace(' ', '_') for col in df.columns]
+                
                 # Explicitly drop 'Adj Close' if present, as we use 'Close'
                 if 'Adj_Close' in df.columns:
                      df = df.drop(columns=['Adj_Close'])
-                return df[['Open', 'High', 'Low', 'Close', 'Volume']] # Standardize output columns
+                
+                # Final column selection ensuring OHLCV availability
+                available_cols = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in df.columns]
+                return df[available_cols] 
         except Exception as e:
             self.logger.debug(f"YFinance download failed for {symbol}: {type(e).__name__} - {e}")
         return None
@@ -344,8 +368,10 @@ class EnhancedDataFetcher:
                             df[col] = pd.to_numeric(df[col], errors='coerce')
 
                         return df[['Open', 'High', 'Low', 'Close', 'Volume']] # Standardize output columns
+        except (requests.exceptions.RequestException, ValueError, TypeError) as e:
+            self.logger.debug(f"Direct Yahoo API fail for {symbol}: {e}")
         except Exception as e:
-            self.logger.debug(f"Direct YF API failed for {symbol}: {type(e).__name__} - {e}")
+            self.logger.error(f"Unexpected error in _fetch_yf_direct for {symbol}: {type(e).__name__} - {e}")
         return None
 
     def _fetch_investing_com(self, symbol: str) -> Optional[pd.DataFrame]:
@@ -461,6 +487,9 @@ class EnhancedDataFetcher:
 
     def fetch_data(self, symbol: str, period: str = Config.DATA_PERIOD_SIGNAL) -> pd.DataFrame:
         """Main fetch method with multiple fallbacks and caching."""
+        if not symbol or not symbol.strip():
+            self.logger.warning("Empty symbol passed to fetch_data.")
+            return pd.DataFrame()
 
         # Try cache first
         df = self._load_cache(symbol, ignore_freshness=False)
@@ -488,13 +517,20 @@ class EnhancedDataFetcher:
                     df = fetch_method(symbol, current_period)
                     if df is not None and not df.empty:
                         # Check for minimum data points required for features + target
-                        min_data_points = max(Config.LOOKBACK_WINDOWS) + Config.PREDICTION_HORIZON + 10 # Add buffer
+                        # If 1d data is requested (monitoring), relax requirement to 10 bars
+                        # For signal generation, we still need full lookback windows
+                        is_monitoring = (period == "1d")
+                        min_data_points = 10 if is_monitoring else max(Config.LOOKBACK_WINDOWS) + Config.PREDICTION_HORIZON + 10
+                        
                         if len(df) >= min_data_points:
-                             self.logger.info(f"Successfully fetched {len(df)} days for {symbol} using {fetch_method.__name__}")
+                             if is_monitoring:
+                                 self.logger.debug(f"Successfully fetched {len(df)} bars for monitor using {fetch_method.__name__}")
+                             else:
+                                 self.logger.info(f"Successfully fetched {len(df)} days for {symbol} using {fetch_method.__name__}")
                              self._save_cache(symbol, df)
                              return df
                         else:
-                            self.logger.warning(f"Fetched only {len(df)} days from {fetch_method.__name__}, insufficient for processing.")
+                            self.logger.warning(f"Fetched only {len(df)} bars from {fetch_method.__name__}, insufficient for processing (need {min_data_points}).")
                             fetched_df = df # Keep the insufficient data just in case, maybe combine later? (Complex, skip for now)
 
                 except Exception as e:
@@ -531,14 +567,8 @@ class FeatureEngine:
 
         try:
             df = df.copy()
-            feature_dict = {}  # Dictionary to collect all features
-
-            # Keep original OHLCV columns in the feature dictionary first
-            required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-            for col in required_cols:
-                feature_dict[col] = df[col]  # Add OHLCV columns to feature_dict
-
-            # --- Basic TA features from 'ta' library ---
+            
+            # --- Add Baseline TA features ---
             try:
                 df = df.sort_index()
                 ta_df = add_all_ta_features(
@@ -546,211 +576,91 @@ class FeatureEngine:
                     low="Low", close="Close",
                     volume="Volume", fillna=True
                 )
-                # Add TA features to dictionary
-                for col in ta_df.columns:
-                    if col not in required_cols:
-                        feature_dict[col] = ta_df[col]
+                df = ta_df
             except Exception as e:
                 logging.warning(f"TA library feature creation failed: {e}")
 
-            # --- Custom features ---
-
-            # Volatility features
-            try:
-                # Calculate range and TR
-                feature_dict['range'] = df['High'] - df['Low']
-                feature_dict['tr'] = np.maximum(
-                    df['High'] - df['Low'],
-                    np.maximum(
-                        abs(df['High'] - df['Close'].shift(1)),
-                        abs(df['Low'] - df['Close'].shift(1))
-                    )
-                )
-
-                # Range ratio
-                feature_dict['range_ratio'] = np.where(
-                    df['Close'].shift(1) != 0,
-                    feature_dict['range'] / df['Close'].shift(1),
-                    0
-                )
-
-                # ATR and ratios
-                atr = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14, fillna=True)
-                feature_dict["atr"] = atr.average_true_range()
-                feature_dict["atr_ratio"] = np.where(
-                    df["Close"] != 0,
-                    feature_dict["atr"] / df["Close"],
-                    0
-                )
-
-                # Bollinger Bands
-                bb = BollingerBands(df["Close"], window=20, window_dev=2, fillna=True)
-                bb_mavg = bb.bollinger_mavg()
-                feature_dict["bb_width"] = np.where(
-                    bb_mavg != 0,
-                    (bb.bollinger_hband() - bb.bollinger_lband()) / bb_mavg,
-                    0
-                )
-                feature_dict["bb_position"] = np.where(
-                    (bb.bollinger_hband() - bb.bollinger_lband()) != 0,
-                    (df["Close"] - bb.bollinger_lband()) / (bb.bollinger_hband() - bb.bollinger_lband()),
-                    0.5
-                )
-            except Exception as e:
-                logging.warning(f"Custom volatility features failed: {e}")
-
-            # Trend strength
-            try:
-                adx = ADXIndicator(df["High"], df["Low"], df["Close"], window=14, fillna=True)
-                feature_dict["adx"] = adx.adx()
-                feature_dict["trend_strength_adx"] = np.where(feature_dict["adx"] > 25, 1, 0)
-            except Exception as e:
-                logging.warning(f"Custom ADX feature failed: {e}")
-
-            # Price action patterns
-            try:
-                feature_dict["body"] = df["Close"] - df["Open"]
-                feature_dict["upper_shadow"] = df["High"] - df[["Open", "Close"]].max(axis=1)
-                feature_dict["lower_shadow"] = df[["Open", "Close"]].min(axis=1) - df["Low"]
-                feature_dict["full_range"] = df["High"] - df["Low"]
-
-                # Calculate ratios with safe division
-                feature_dict["body_ratio"] = np.where(
-                    feature_dict["full_range"] > 0,
-                    abs(feature_dict["body"]) / feature_dict["full_range"],
-                    0
-                )
-                feature_dict["upper_shadow_ratio"] = np.where(
-                    feature_dict["full_range"] > 0,
-                    feature_dict["upper_shadow"] / feature_dict["full_range"],
-                    0
-                )
-                feature_dict["lower_shadow_ratio"] = np.where(
-                    feature_dict["full_range"] > 0,
-                    feature_dict["lower_shadow"] / feature_dict["full_range"],
-                    0
-                )
-
-                # Candlestick patterns - ensure all are converted to int
-                feature_dict["doji"] = (feature_dict["body_ratio"] <= 0.1).astype(int)
-
-                # Calculate hammer pattern
-                feature_dict["hammer"] = np.where(
-                    (feature_dict["lower_shadow_ratio"] > 2 * feature_dict["body_ratio"]) &
-                    (feature_dict["upper_shadow_ratio"] <= 0.2),  # Simplified condition
-                    1,
-                    0
-                )
-
-                # Calculate shooting star pattern
-                feature_dict["shooting_star"] = np.where(
-                    (feature_dict["upper_shadow_ratio"] > 2 * feature_dict["body_ratio"]) &
-                    (feature_dict["lower_shadow_ratio"] <= 0.2),  # Simplified condition
-                    1,
-                    0
-                )
-            except Exception as e:
-                logging.warning(f"Price action features failed: {e}")
-
-            # Volume analysis
-            try:
-                df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0)
-                feature_dict["volume_ma_20d"] = df["Volume"].rolling(window=20, min_periods=1).mean()
-
-                # Modified volume ratio calculation to handle zero values
-                volume_ratio = np.where(
-                    (feature_dict["volume_ma_20d"] > 0) & (df["Volume"] > 0),
-                    df["Volume"] / feature_dict["volume_ma_20d"],
-                    1.0
-                )
-                feature_dict["volume_ratio_20d"] = volume_ratio
-
-                # Fix: Explicitly add the volume_spike feature to feature_dict
-                # Previous code created volume_spikes array but didn't properly add it to feature_dict
-                feature_dict["volume_spike"] = np.where(volume_ratio > Config.MIN_VOLUME_RATIO, 1, 0)
-
-            except Exception as e:
-                logging.warning(f"Volume analysis features failed: {e}")
-                # Initialize features with default values on error
-                feature_dict["volume_ma_20d"] = df["Volume"].rolling(window=20, min_periods=1).mean().fillna(0)
-                feature_dict["volume_ratio_20d"] = pd.Series(1.0, index=df.index)
-                # Fix: Ensure volume_spike gets a default value even on error
-                feature_dict["volume_spike"] = pd.Series(0, index=df.index)
-
-            # Multiple timeframe features
-            try:
-                for window in Config.LOOKBACK_WINDOWS:
-                    # Returns
-                    feature_dict[f"return_{window}d"] = df["Close"].pct_change(periods=window)
-
+            # --- Add Custom Features ---
+            df['range'] = df['High'] - df['Low']
+            df['tr'] = np.maximum(df['High'] - df['Low'], np.maximum(
+                abs(df['High'] - df['Close'].shift(1)),
+                abs(df['Low'] - df['Close'].shift(1))
+            ))
+            df['range_ratio'] = (df['range'] / df['Close'].shift(1)).fillna(0)
+            
+            # --- Enhanced Microstructure Features (The Edge) ---
+            if Config.USE_ENHANCED_FEATURES and add_enhanced_features:
+                df = add_enhanced_features(df)
+            
+            # --- Feature Selection (Noise Pruning) ---
+            if Config.SELECTED_FEATURES_ONLY:
+                # Curated list of high-impact features identified in Step 6
+                SELECTED_FEATURES = [
+                    # Trend & Momentum
+                    'trend_adx', 'trend_ema_fast', 'trend_ema_slow', 'trend_macd_diff', 
+                    'momentum_rsi', 'momentum_stoch_rsi', 'momentum_wr',
                     # Volatility
-                    feature_dict[f"volatility_{window}d"] = df["Close"].pct_change().rolling(
-                        window=window,
-                        min_periods=1
-                    ).std()
+                    'atr', 'atr_ratio', 'bb_width', 'volatility_bbli',
+                    # Volume
+                    'volume_obv', 'volume_cmf', 'volume_surge_ratio',
+                    # Microstructure (The new edge)
+                    'vwap_deviation_pct', 'dist_from_high_pct', 'dist_from_low_pct',
+                    'orb_position', 'volatility_squeeze', 'candle_strength',
+                    'range_expansion', 'session_progress',
+                    'range_ratio', 'intraday_momentum'
+                ]
+                # Filter to only those that exist
+                existing_cols = [c for c in SELECTED_FEATURES if c in df.columns]
+                # Also keep basic OHLC for safety in some logic
+                for ohlc in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                    if ohlc not in existing_cols: existing_cols.append(ohlc)
+                
+                df = df[existing_cols]
 
-                    # Price to MA ratio
-                    ma = df["Close"].rolling(window=window, min_periods=1).mean()
-                    feature_dict[f"price_to_ma_{window}d"] = np.where(ma > 0, df["Close"] / ma - 1, 0)
-
-                    # Volume ratios
-                    feature_dict[f"volume_ma_{window}d"] = df["Volume"].rolling(
-                        window=window,
-                        min_periods=1
-                    ).mean()
-                    feature_dict[f"volume_ratio_{window}d"] = np.where(
-                        feature_dict[f"volume_ma_{window}d"] > 0,
-                        df["Volume"] / feature_dict[f"volume_ma_{window}d"],
-                        1.0
-                    )
-            except Exception as e:
-                logging.warning(f"Multiple timeframe features failed: {e}")
-
-
-            # Create final DataFrame all at once with OHLCV included
-            feature_df = pd.DataFrame(feature_dict, index=df.index)
-
+            return df
             # Final cleanup
-            feature_df = feature_df.replace([np.inf, -np.inf], np.nan)
+            df = df.replace([np.inf, -np.inf], np.nan)
             # Forward-fill only to avoid future leakage; drop remaining NaNs or set conservative defaults
-            feature_df = feature_df.fillna(method='ffill')
-            feature_df = feature_df.fillna(0)
+            df = df.ffill()
+            df = df.fillna(0)
 
-            preserved_cols = required_cols + ['volume_spike']
-            non_preserved_cols = [col for col in feature_df.columns if col not in preserved_cols]
-            constant_cols = [col for col in non_preserved_cols if feature_df[col].nunique() <= 1]
-            feature_df = feature_df.drop(columns=constant_cols)
+            # Prune constant features
+            non_preserved_cols = [col for col in df.columns if col not in ['Open', 'High', 'Low', 'Close', 'Volume']]
+            constant_cols = [col for col in non_preserved_cols if df[col].nunique() <= 1]
+            df = df.drop(columns=constant_cols)
 
-            logging.info(f"Feature creation successful. Final DataFrame shape: {feature_df.shape}")
-            return feature_df
+            logging.info(f"Feature creation successful. Final DataFrame shape: {df.shape}")
+            return df
         except Exception as e:
             logging.error(f"Overall Feature creation failed: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
             return pd.DataFrame()
 
 # ================== Meta Probability Estimator ==================
-class MetaProbEstimator(BaseEstimator, ClassifierMixin):
+class PlattCalibratedClassifier:
     """
-    Wrapper estimator for meta-classifier that can be pickled.
-    This class wraps the meta-classifier to provide probability predictions
-    for calibration purposes.
+    Manual Platt scaling (sigmoid calibration) wrapper.
+    Chains: meta_clf.predict_proba(X) -> sigmoid scaler -> calibrated probability.
+    Bypasses CalibratedClassifierCV which has sklearn version issues.
     """
-    _estimator_type = "classifier"
-    
-    def __init__(self, meta_clf=None):
+    def __init__(self, meta_clf, platt_scaler):
         self.meta_clf = meta_clf
-        if hasattr(meta_clf, 'classes_'):
-            self.classes_ = meta_clf.classes_
-        else:
-            self.classes_ = np.array([0, 1])  # Default binary
+        self.platt_scaler = platt_scaler
 
     def predict_proba(self, X):
-        """Predict class probabilities using the meta-classifier."""
-        return self.meta_clf.predict_proba(X)
-
-    def fit(self, X, y):
-        """Fit method required by sklearn interface."""
-        self.classes_ = np.unique(y)
-        return self
+        """Get calibrated probabilities: meta_clf -> platt sigmoid -> output."""
+        raw_proba = self.meta_clf.predict_proba(X)
+        if raw_proba.shape[1] == 2:
+            # Binary case
+            p_pos = self.platt_scaler.predict_proba(raw_proba[:, 1].reshape(-1, 1))[:, 1]
+            return np.column_stack([1 - p_pos, p_pos])
+        else:
+            # Multiclass case: calibrating each class OVR (simplified)
+            # For 3-class, we return the meta_clf probs directly if platt is complex,
+            # or apply platt to each if we trained OVR calibrators.
+            # For now, return meta_clf probs for multiclass to avoid complexity.
+            return raw_proba
 
 # ================== Model Training ==================
 class ModelTrainer:
@@ -761,20 +671,25 @@ class ModelTrainer:
         self.base_models = {} # Initialize here to check availability
 
         # Initialize base models based on imports
+        is_multiclass = Config.TARGET_MODE == 'three_class'
+        objective = "multiclass" if is_multiclass else "binary"
+        
         if LGBMClassifier:
              self.base_models["lgb"] = LGBMClassifier(
                  n_estimators=500, learning_rate=0.01, num_leaves=32, subsample=0.8,
-                 colsample_bytree=0.8, objective="binary", n_jobs=-1, random_state=42, verbosity=-1
+                 colsample_bytree=0.8, objective=objective, n_jobs=-1, random_state=42, verbosity=-1
              )
         if XGBClassifier:
              self.base_models["xgb"] = XGBClassifier(
                  n_estimators=500, learning_rate=0.01, max_depth=6, subsample=0.8,
-                 colsample_bytree=0.8, objective="binary:logistic", eval_metric="logloss",
+                 colsample_bytree=0.8, objective="multi:softprob" if is_multiclass else "binary:logistic",
+                 eval_metric="mlogloss" if is_multiclass else "logloss",
                  n_jobs=-1, random_state=42, verbosity=0
              )
         if CatBoostClassifier:
              self.base_models["cat"] = CatBoostClassifier(
-                 iterations=500, learning_rate=0.01, depth=6, loss_function="Logloss",
+                 iterations=500, learning_rate=0.01, depth=6, 
+                 loss_function="MultiClass" if is_multiclass else "Logloss",
                  verbose=False, random_seed=42
              )
 
@@ -809,7 +724,7 @@ class ModelTrainer:
                  self.logger.error("'target' column not found in DataFrame passed to prepare_data.")
                  return pd.DataFrame(), pd.Series()
 
-            # Drop any remaining NaNs in target column (already done in the revised workflow)
+            # Drop any remaining NaNs in target column (now handled by target calculation, but safe to keep)
             df = df.dropna(subset=["target"])
 
             if len(df) < 30: # Minimum samples for reasonable split/training
@@ -829,21 +744,29 @@ class ModelTrainer:
 
             X = df[feature_cols]
             y = df["target"]
+            
+            # Ensure target is integer for multiclass
+            if Config.TARGET_MODE == 'three_class':
+                y = y.astype(int)
 
             # Final check for NaNs/Infinities in features just before training
             X = X.replace([np.inf, -np.inf], np.nan)
             if X.isna().any().any():
                  self.logger.warning(f"NaNs found in features before training. Imputing...")
-                 X = X.fillna(X.median()) # Use median imputation as a fallback
+                 # Fix: Global Data Leakage
+                 # Forward fill first to avoid leaking future data
+                 X = X.ffill()
+                 # If any NaNs remain at the very beginning, backward fill them 
+                 X = X.bfill()
 
             self.feature_columns = feature_cols
             self.logger.info(f"Prepared data for training: {len(X)} samples, {len(feature_cols)} features. Target distribution:\n{y.value_counts()}")
 
-            # Check class balance again
+            # Check class balance
             class_counts = y.value_counts(normalize=True)
-            if len(class_counts) < 2 or min(class_counts) < 0.05: # Warn if minority class is less than 5%
-                 self.logger.warning(f"Significant class imbalance: {class_counts.to_dict()}")
-
+            self.logger.info(f"Class distribution: {class_counts.to_dict()}")
+            if len(class_counts) < 2:
+                 self.logger.warning("Only one class found in target data!")
 
             return X, y
 
@@ -865,7 +788,11 @@ class ModelTrainer:
 
             cv_scores = []
             # Store OOF predictions and corresponding true labels for meta-training and calibration
-            oof_meta_features = np.zeros((len(X), len(self.base_models)))
+            is_multiclass = Config.TARGET_MODE == 'three_class'
+            num_classes_per_model = 3 if is_multiclass else 1
+            meta_feature_cols = len(self.base_models) * num_classes_per_model
+            
+            oof_meta_features = np.zeros((len(X), meta_feature_cols))
             oof_labels = y.copy() # Will remove rows later if no predictions were made
 
             # Train base models on CV folds and collect OOF predictions
@@ -882,7 +809,7 @@ class ModelTrainer:
                          self.logger.warning(f"Skipping Fold {fold+1} due to insufficient validation data or single class.")
                          continue
 
-                    fold_meta_val = np.zeros((len(val_idx), len(self.base_models)))
+                    fold_meta_val = np.zeros((len(val_idx), meta_feature_cols))
 
                     for i, (name, model) in enumerate(self.base_models.items()):
                         try:
@@ -893,16 +820,18 @@ class ModelTrainer:
                             if isinstance(fold_model, (LGBMClassifier, XGBClassifier, CatBoostClassifier)):
                                 # Use early stopping if validation set is large enough
                                 if len(X_val) > 100: # Arbitrary threshold for early stopping
-                                     eval_set = [(X_val, y_val)]
-                                     fit_params = {"eval_set": eval_set, "early_stopping_rounds": 50, "verbose": False}
-                                     # Check if model supports early stopping args
-                                     if hasattr(fold_model, 'fit'):
-                                         import inspect
-                                         fit_signature = inspect.signature(fold_model.fit)
-                                         if 'eval_set' in fit_signature.parameters and 'early_stopping_rounds' in fit_signature.parameters:
-                                             fold_model.fit(X_train, y_train, **fit_params)
-                                         else:
-                                            fold_model.fit(X_train, y_train) # Fit without early stopping
+                                    eval_set = [(X_val, y_val)]
+                                    if isinstance(fold_model, LGBMClassifier):
+                                        try:
+                                            from lightgbm import early_stopping
+                                            fold_model.fit(X_train, y_train, eval_set=eval_set, callbacks=[early_stopping(50, verbose=False)])
+                                        except ImportError:
+                                            fold_model.fit(X_train, y_train, eval_set=eval_set, early_stopping_rounds=50, verbose=False) # Fallback for old lightgbm
+                                    elif isinstance(fold_model, XGBClassifier):
+                                        fold_model.set_params(early_stopping_rounds=50)
+                                        fold_model.fit(X_train, y_train, eval_set=eval_set, verbose=False)
+                                    elif isinstance(fold_model, CatBoostClassifier):
+                                        fold_model.fit(X_train, y_train, eval_set=eval_set, early_stopping_rounds=50, verbose=False)
                                 else:
                                     fold_model.fit(X_train, y_train)
 
@@ -913,10 +842,19 @@ class ModelTrainer:
 
                             # Store predictions for the meta-classifier training (OOF predictions)
                             if hasattr(fold_model, 'predict_proba'):
-                                fold_meta_val[:, i] = fold_model.predict_proba(X_val)[:, 1]
+                                probs = fold_model.predict_proba(X_val)
+                                if is_multiclass:
+                                    for c_idx in range(3):
+                                        fold_meta_val[:, i * 3 + c_idx] = probs[:, c_idx]
+                                else:
+                                    fold_meta_val[:, i] = probs[:, 1]
                             else:
-                                # Fallback for models without predict_proba (though our list has them)
-                                fold_meta_val[:, i] = fold_model.predict(X_val) # This is less ideal for calibration
+                                if is_multiclass:
+                                    pred = fold_model.predict(X_val)
+                                    for row_idx, p_val in enumerate(pred):
+                                        fold_meta_val[row_idx, i * 3 + int(p_val)] = 1.0
+                                else:
+                                    fold_meta_val[:, i] = fold_model.predict(X_val)
 
                         except Exception as e:
                             self.logger.warning(f"Base model '{name}' failed in Fold {fold+1}: {type(e).__name__} - {e}")
@@ -928,15 +866,21 @@ class ModelTrainer:
                     oof_indices.extend(val_idx)
                     temp_meta_clf = LogisticRegression(C=0.1, max_iter=1000, random_state=42)
                     temp_meta_clf.fit(fold_meta_val, y_val)
-                    fold_val_pred_proba = temp_meta_clf.predict_proba(fold_meta_val)[:, 1]
+                    fold_val_pred_proba = temp_meta_clf.predict_proba(fold_meta_val)
 
                     # Calculate metrics for the fold
                     try:
-                        auc = roc_auc_score(y_val, fold_val_pred_proba)
-                        # Use a reasonable threshold (e.g., 0.5 or Config threshold) for precision/recall for reporting
-                        binary_pred = (fold_val_pred_proba > Config.CONFIDENCE_THRESHOLD).astype(int)
-                        precision = precision_score(y_val, binary_pred, zero_division=0)
-                        recall = recall_score(y_val, binary_pred, zero_division=0)
+                        if is_multiclass:
+                            auc = roc_auc_score(y_val, fold_val_pred_proba, multi_class='ovr')
+                            mc_pred = np.argmax(fold_val_pred_proba, axis=1)
+                            precision = precision_score(y_val, mc_pred, average='weighted', zero_division=0)
+                            recall = recall_score(y_val, mc_pred, average='weighted', zero_division=0)
+                        else:
+                            binary_probs = fold_val_pred_proba[:, 1]
+                            auc = roc_auc_score(y_val, binary_probs)
+                            binary_pred = (binary_probs > Config.CONFIDENCE_THRESHOLD).astype(int)
+                            precision = precision_score(y_val, binary_pred, zero_division=0)
+                            recall = recall_score(y_val, binary_pred, zero_division=0)
 
                         self.logger.info(f"Fold {fold+1} Metrics: AUC={auc:.3f}, Precision={precision:.3f}, Recall={recall:.3f}")
                         cv_scores.append({
@@ -954,68 +898,25 @@ class ModelTrainer:
             X_indexed = X.copy() # Use index for reliable joining
             y_indexed = y.copy()
 
-            # Dictionary to hold OOF predictions by index for each base model
-            oof_preds_dict = {name: pd.Series(index=X_indexed.index, dtype=float) for name in self.base_models.keys()}
-
-            # List to store metrics for each fold
-            cv_scores_recalc = []
-
-            # Iterate through folds to train base models and get OOF predictions
-            for fold, (train_idx, val_idx) in enumerate(cv.split(X_indexed)):
-                 try:
-                    self.logger.info(f"Base Model OOF Training Fold {fold+1}/{n_splits}")
-                    X_train, X_val = X_indexed.iloc[train_idx], X_indexed.iloc[val_idx]
-                    y_train, y_val = y_indexed.iloc[train_idx], y_indexed.iloc[val_idx]
-
-                    if len(y_val) < 20 or len(y_val.unique()) < 2:
-                         self.logger.warning(f"Skipping Base Model OOF Fold {fold+1} due to insufficient validation data or single class.")
-                         continue
-
-                    fold_val_indices = X_val.index # Get original indices
-
-                    for name, model in self.base_models.items():
-                        try:
-                             # Clone model for independent fold training
-                            import copy
-                            fold_model = copy.deepcopy(model)
-
-                            # Use early stopping where applicable
-                            if isinstance(fold_model, (LGBMClassifier, XGBClassifier, CatBoostClassifier)) and len(X_val) > 100:
-                                eval_set = [(X_val, y_val)]
-                                fit_params = {"eval_set": eval_set, "early_stopping_rounds": 50, "verbose": False}
-                                import inspect
-                                fit_signature = inspect.signature(fold_model.fit)
-                                if 'eval_set' in fit_signature.parameters and 'early_stopping_rounds' in fit_signature.parameters:
-                                    fold_model.fit(X_train, y_train, **fit_params)
-                                else:
-                                   fold_model.fit(X_train, y_train) # Fit without early stopping
-                            elif hasattr(fold_model, 'fit'):
-                                 fold_model.fit(X_train, y_train)
-                            else:
-                                self.logger.warning(f"Model '{name}' in Fold {fold+1} is not trainable.")
-                                continue # Skip prediction if not trainable
-
-                            # Store OOF predictions for this fold's validation set
-                            if hasattr(fold_model, 'predict_proba'):
-                                fold_preds = fold_model.predict_proba(X_val)[:, 1]
-                                oof_preds_dict[name].loc[fold_val_indices] = fold_preds
-                            else:
-                                # Fallback - less ideal
-                                fold_preds = fold_model.predict(X_val)
-                                oof_preds_dict[name].loc[fold_val_indices] = fold_preds
-                            self.logger.debug(f"Obtained OOF preds for model '{name}' in Fold {fold+1}")
-
-                        except Exception as e:
-                            self.logger.warning(f"Base model '{name}' prediction failed in Fold {fold+1}: {type(e).__name__} - {e}")
-                            # Leave NaN in oof_preds_dict for this model/index
-
-
-                 except Exception as e:
-                     self.logger.error(f"An error occurred during Base Model OOF Fold {fold+1}: {type(e).__name__} - {e}")
-                     continue
-
+            # Create OOF DataFrame directly from the first loop's oof_meta_features
+            is_multiclass = Config.TARGET_MODE == 'three_class'
+            
+            col_names = []
+            for name in self.base_models.keys():
+                if is_multiclass:
+                    for c_idx in range(3):
+                        col_names.append(f"{name}_prob_{c_idx}")
+                else:
+                    col_names.append(name)
+                    
+            # Replace 0s with NaNs for rows that were never in val_idx
+            valid_oof_mask = np.zeros(len(X), dtype=bool)
+            valid_oof_mask[oof_indices] = True
+            oof_meta_features_clean = np.where(valid_oof_mask[:, None], oof_meta_features, np.nan)
+            
             # Combine OOF predictions into a DataFrame
-            oof_meta_df = pd.DataFrame(oof_preds_dict)
+            cv_scores_recalc = []
+            oof_meta_df = pd.DataFrame(oof_meta_features_clean, index=X_indexed.index, columns=col_names)
 
             # Align OOF predictions with true labels, drop rows where any base model failed to predict OOF
             oof_meta_df = oof_meta_df.dropna()
@@ -1040,41 +941,39 @@ class ModelTrainer:
                 self.logger.error(f"Meta-classifier training failed: {type(e).__name__} - {e}")
                 return {}
 
-            # --- Probability Calibration on Meta-Classifier OOF predictions ---
+            # --- Probability Calibration via Manual Platt Scaling ---
+            # Bypasses CalibratedClassifierCV (has sklearn version issues)
             try:
-                # Get predictions from the trained meta-classifier on the same OOF data
-                oof_meta_preds_proba = meta_clf.predict_proba(oof_meta_df)[:, 1]
-
-                # Use CalibratedClassifierCV with method='isotonic' on the OOF meta predictions
-                # 'prefit' means it uses the already trained `meta_clf`
-                calibrator = CalibratedClassifierCV(meta_clf, cv='prefit', method='isotonic')
-
-                # from sklearn.isotonic import CalibratedClassifierCV as IsotonicCalibrator # Use the class name for clarity
-                from sklearn.calibration import CalibratedClassifierCV as IsotonicCalibrator
-                
-                # Instantiate the module-level MetaProbEstimator wrapping the trained meta_clf
-                meta_prob_estimator = MetaProbEstimator(meta_clf)
-
-                calibrator = IsotonicCalibrator(meta_prob_estimator, cv='prefit', method='isotonic')
-
-                # Fit the calibrator. Since cv='prefit', it uses meta_prob_estimator to predict on X=oof_meta_df
-                # and fits the calibrator mapping these probabilities to y=oof_labels_aligned.
-                calibrator.fit(oof_meta_df, oof_labels_aligned)
-
-                self.logger.info("Probability calibrator trained successfully on meta-classifier OOF predictions.")
-
-                 # Evaluate meta + calibrated model on OOF predictions
-                calibrated_oof_preds = calibrator.predict_proba(oof_meta_df)[:, 1]
+                # Get raw meta-classifier probabilities on OOF data
+                # For Platt calibration in multiclass, we'd need OVR calibrators.
+                # To keep it simple, we only calibrate the "Bullish" prob if binary.
+                if is_multiclass:
+                    calibrator = meta_clf
+                    calibrated_oof_preds = meta_clf.predict_proba(oof_meta_df)
+                    self.logger.info("Multiclass meta-classifier trained. Calibration skipped (OVR complexity).")
+                else:
+                    oof_meta_preds_proba = meta_clf.predict_proba(oof_meta_df)[:, 1]
+                    platt_scaler = LogisticRegression(C=1.0, max_iter=1000, random_state=42)
+                    platt_scaler.fit(oof_meta_preds_proba.reshape(-1, 1), oof_labels_aligned)
+                    calibrator = PlattCalibratedClassifier(meta_clf, platt_scaler)
+                    calibrated_oof_preds = platt_scaler.predict_proba(oof_meta_preds_proba.reshape(-1, 1))
+                    self.logger.info("Binary probability calibrator trained successfully.")
 
                 try:
-                    cal_auc = roc_auc_score(oof_labels_aligned, calibrated_oof_preds)
-                    cal_binary_pred = (calibrated_oof_preds > Config.CONFIDENCE_THRESHOLD).astype(int)
-                    cal_precision = precision_score(oof_labels_aligned, cal_binary_pred, zero_division=0)
-                    cal_recall = recall_score(oof_labels_aligned, cal_binary_pred, zero_division=0)
+                    is_multiclass = Config.TARGET_MODE == 'three_class'
+                    if is_multiclass:
+                        cal_auc = roc_auc_score(oof_labels_aligned, calibrated_oof_preds, multi_class='ovr')
+                        cal_binary_pred = np.argmax(calibrated_oof_preds, axis=1)
+                        cal_precision = precision_score(oof_labels_aligned, cal_binary_pred, average='weighted', zero_division=0)
+                        cal_recall = recall_score(oof_labels_aligned, cal_binary_pred, average='weighted', zero_division=0)
+                    else:
+                        cal_auc = roc_auc_score(oof_labels_aligned, calibrated_oof_preds[:, 1])
+                        cal_binary_pred = (calibrated_oof_preds[:, 1] > Config.CONFIDENCE_THRESHOLD).astype(int)
+                        cal_precision = precision_score(oof_labels_aligned, cal_binary_pred, zero_division=0)
+                        cal_recall = recall_score(oof_labels_aligned, cal_binary_pred, zero_division=0)
 
                     self.logger.info(f"Calibrated OOF Metrics (Meta+Calibrator): AUC={cal_auc:.3f}, Precision={cal_precision:.3f}, Recall={cal_recall:.3f}")
 
-                    # Add these overall OOF scores to CV scores list or store separately
                     cv_scores_recalc.append({
                          'fold': 'Overall_OOF',
                          'auc': cal_auc,
@@ -1086,29 +985,49 @@ class ModelTrainer:
                 except Exception as e:
                     self.logger.warning(f"Calibrated OOF metric calculation failed: {e}")
 
-
             except Exception as e:
-                self.logger.error(f"Probability calibration failed: {type(e).__name__} - {e}")
-                 # Use the uncalibrated meta-classifier as a fallback
+                self.logger.error(f"Platt calibration failed: {type(e).__name__} - {e}")
                 calibrator = meta_clf
-                self.logger.warning("Using uncalibrated meta-classifier for final predictions.")
+                self.logger.warning("Using uncalibrated meta-classifier as fallback.")
 
 
             # --- Train Final Base Models on the entire dataset ---
-            # These are used for prediction on new data, not for training the meta-classifier
+            # Fix: Introduce synthetic 'eval_set' for Early Stopping on final base models
             final_base_models = {}
+            
+            # Split the last 10% of X and y sequentially as the hold-out eval set
+            eval_size = int(len(X) * 0.10)
+            X_train_final = X.iloc[:-eval_size]
+            y_train_final = y.iloc[:-eval_size]
+            X_eval_final = X.iloc[-eval_size:]
+            y_eval_final = y.iloc[-eval_size:]
+
             for name, model in self.base_models.items():
                  try:
-                    self.logger.info(f"Training final base model '{name}' on full dataset.")
+                    self.logger.info(f"Training final base model '{name}' on full dataset with validation.")
                     import copy
                     final_model = copy.deepcopy(model) # Clone for final training
 
                     if hasattr(final_model, 'fit'):
-                         # For GB models, training on the full dataset might not need early stopping
-                         # as there's no separate validation set here.
-                         final_model.fit(X, y)
-                         final_base_models[name] = final_model
-                         self.logger.info(f"Final base model '{name}' trained.")
+                        if isinstance(final_model, (LGBMClassifier, XGBClassifier, CatBoostClassifier)):
+                            eval_set = [(X_eval_final, y_eval_final)]
+                            if isinstance(final_model, LGBMClassifier):
+                                try:
+                                    from lightgbm import early_stopping
+                                    final_model.fit(X_train_final, y_train_final, eval_set=eval_set, callbacks=[early_stopping(50, verbose=False)])
+                                except ImportError:
+                                    final_model.fit(X_train_final, y_train_final, eval_set=eval_set, early_stopping_rounds=50, verbose=False)
+                            elif isinstance(final_model, XGBClassifier):
+                                final_model.set_params(early_stopping_rounds=50)
+                                final_model.fit(X_train_final, y_train_final, eval_set=eval_set, verbose=False)
+                            elif isinstance(final_model, CatBoostClassifier):
+                                final_model.fit(X_train_final, y_train_final, eval_set=eval_set, early_stopping_rounds=50, verbose=False)
+                        else:
+                             # For models like LogisticRegression pipeline
+                             final_model.fit(X, y)
+                        
+                        final_base_models[name] = final_model
+                        self.logger.info(f"Final base model '{name}' trained.")
                     else:
                          self.logger.warning(f"Model '{name}' is not trainable for final fit.")
 
@@ -1121,10 +1040,13 @@ class ModelTrainer:
                  self.logger.critical("No base models trained successfully on the full dataset. Cannot create final model pack.")
                  return {}
 
+            # Fix: Track the exact feature sequence (names) for model alignment
+            ordered_base_names = list(final_base_models.keys())
 
             # Final model package
             model_pack = {
                 'base_models': final_base_models, # Base models trained on full data
+                'ordered_base_names': ordered_base_names, # To preserve column alignment in meta_features
                 'meta_clf': meta_clf,             # Meta-classifier trained on OOF
                 'calibrator': calibrator,         # Calibrator trained on meta_clf OOF output
                 'features': self.feature_columns, # List of feature names
@@ -1223,34 +1145,29 @@ class TradingBot:
         }
 
     def _calculate_target(self, df: pd.DataFrame) -> pd.Series:
-        """Calculates the target variable (future price movement)."""
-        if df.empty or len(df) < Config.PREDICTION_HORIZON + 1:
-             self.logger.warning("Insufficient data for target calculation.")
+        """Calculates improved target labeling (triple-barrier method)."""
+        if df.empty or len(df) < Config.LOOKBACK_WINDOWS[-1] + 20:
              return pd.Series()
 
         try:
-            # Ensure 'Close' column is present and numeric
-            if 'Close' not in df.columns:
-                 self.logger.error("Close column missing for target calculation.")
-                 return pd.Series()
-
-            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-            df = df.dropna(subset=['Close']) # Drop rows where Close is NaN
-
-            if len(df) < Config.PREDICTION_HORIZON + 1:
-                 self.logger.warning("Insufficient data after dropping NaN Close values for target calculation.")
-                 return pd.Series()
-
-            horizon = Config.PREDICTION_HORIZON
-            threshold = Config.PRICE_MOVEMENT_THRESHOLD
-
-            # Calculate forward returns
-            fwd_returns = df["Close"].shift(-horizon) / df["Close"] - 1
-
-            target = np.where(fwd_returns > threshold, 1.0,
-                            np.where(fwd_returns < -threshold, 0.0, np.nan))
-
-            return pd.Series(target, index=df.index, name='target')
+            if calculate_improved_targets:
+                # Use the new high-quality labeling logic
+                return calculate_improved_targets(
+                    df, 
+                    atr_tp_mult=1.5, 
+                    atr_sl_mult=1.0, 
+                    horizon=Config.PREDICTION_HORIZON,
+                    mode=Config.TARGET_MODE
+                )
+            else:
+                # Fallback to the old simple return-based labeling
+                horizon = Config.PREDICTION_HORIZON
+                threshold = Config.PRICE_MOVEMENT_THRESHOLD
+                fwd_returns = df["Close"].shift(-horizon) / df["Close"] - 1
+                conditions = [fwd_returns > threshold, fwd_returns < -threshold]
+                choices = [1.0, 0.0]
+                target = np.select(conditions, choices, default=np.nan)
+                return pd.Series(target, index=df.index, name='target')
 
         except Exception as e:
             self.logger.error(f"Target calculation failed: {str(e)}")
@@ -1359,7 +1276,9 @@ class TradingBot:
 
                 # Log CV scores if available
                 if 'cv_scores' in model_pack and model_pack['cv_scores']:
-                    avg_auc_overall = np.mean([score['auc'] for score in model_pack['cv_scores'] if isinstance(score['auc'], (int, float)) and score.get('fold') != 'Overall_OOF'])
+                    fold_aucs = [score['auc'] for score in model_pack['cv_scores'] 
+                                 if isinstance(score.get('auc'), (int, float)) and score.get('fold') != 'Overall_OOF']
+                    avg_auc_overall = np.mean(fold_aucs) if fold_aucs else np.nan
                     overall_oof_auc = next((score['auc'] for score in model_pack['cv_scores'] if score.get('fold') == 'Overall_OOF'), np.nan)
 
                     self.logger.info(f"Training complete for {name}. Avg CV AUC: {avg_auc_overall:.3f}, Overall OOF AUC (Calibrated): {overall_oof_auc:.3f}")
@@ -1378,6 +1297,57 @@ class TradingBot:
         - TradingView chart validation
         """
         try:
+            # Fix 4: Dynamic time-based filtering (replaces rigid 14:30 cutoff)
+            # After 3:00 PM, require higher conviction (less time for trade to develop)
+            # After 3:10 PM, block new entries (only 20 min left, too risky)
+            now = datetime.now(Config.TIMEZONE)
+            current_hour = now.hour
+            current_minute = now.minute
+            
+            # Calculate minutes until market close (15:30 IST)
+            minutes_to_close = (15 * 60 + 30) - (current_hour * 60 + current_minute)
+            
+            # After 3:10 PM, hard block (only 20 min remaining)
+            if minutes_to_close < 20:
+                self.logger.info(f"Entry cutoff: Too late for {name} (3:10 PM cutoff, {minutes_to_close} min to close).")
+                return {
+                    'index': name, 'position_size': 0,
+                    'validation_reason': "Too Late (3:10 PM cutoff)",
+                    'price': 0, 'regime': 'N/A'
+                }
+            
+            # Store late_entry flag for later use in validation
+            late_entry = minutes_to_close < 60  # After 2:30 PM
+            
+            # Expiry Day Awareness
+            # On expiry days, gamma risk and pin risk are extreme.
+            # Reduce position size, tighten targets, and raise validator threshold.
+            expiry_adj = None
+            if get_expiry_adjustment is not None:
+                try:
+                    expiry_adj = get_expiry_adjustment(name)
+                    if expiry_adj.get('should_skip', False):
+                        self.logger.info(f"Expiry day skip: Trading disabled for {name} on expiry.")
+                        return {
+                            'index': name, 'position_size': 0, 
+                            'validation_reason': "Expiry Day Skip", 
+                            'price': 0, 'regime': 'N/A'
+                        }
+                    if expiry_adj.get('is_expiry_day', False):
+                        self.logger.info(f"⚠️ EXPIRY DAY for {name}. Applying tighter params.")
+                    elif expiry_adj.get('is_expiry_week', False):
+                        self.logger.info(f"📅 Expiry week for {name}. Applying mild adjustments.")
+                except Exception as e:
+                    self.logger.debug(f"Expiry check failed: {e}")
+                    expiry_adj = None
+            
+            # Fix 9: Cross-index correlation limit
+            # Prevent concentrated same-direction bets across correlated indices
+            open_positions = self.state.state.get('open_positions', {})
+            if len(open_positions) >= 2:
+                open_directions = [p.get('direction') for p in open_positions.values()]
+                # Will check after direction is determined (below)
+            
             model_pack = self.models.get(name)
             if not model_pack:
                 self.logger.warning(f"No trained model available for {name}. Cannot generate signal.")
@@ -1391,7 +1361,11 @@ class TradingBot:
             if raw_df.empty or len(raw_df) < max(Config.LOOKBACK_WINDOWS) + 10:
                 self.logger.warning(f"Insufficient data ({len(raw_df)} bars) for {name}. Skipping signal.")
                 self.error_counts[symbol] = self.error_counts.get(symbol, 0) + 1
-                return None
+                return {
+                    'index': name, 'position_size': 0, 
+                    'validation_reason': "Insufficient Data", 
+                    'price': 0, 'regime': 'N/A'
+                }
 
             # Reset error count on successful fetch
             self.error_counts[symbol] = 0
@@ -1427,12 +1401,61 @@ class TradingBot:
 
             if feature_df.empty:
                 self.logger.warning(f"Feature creation failed for {name}. Skipping signal.")
-                return None
+                return {
+                    'index': name, 'position_size': 0, 
+                    'validation_reason': "Feature Error", 
+                    'price': 0, 'regime': 'N/A'
+                }
 
-            latest_date = feature_df.index[-1]
-            current_features_row = feature_df.iloc[[-1]].copy()
+            # Revised Candle Policy: 4-Minute Look (Optimized for faster entry)
+            # Standard: Wait for full 5m close.
+            # Optimization: If bar is >4m old (80% complete), use it for predictive entry.
+            latest_bar_time = feature_df.index[-1]
+            now = datetime.now(Config.TIMEZONE)
+            if latest_bar_time.tzinfo is None:
+                latest_bar_time = Config.TIMEZONE.localize(latest_bar_time)
+            
+            bar_age_seconds = (now - latest_bar_time).total_seconds()
+            
+            # If bar is very fresh (<240s), it's risky to use for indicators. Use the previous closed bar.
+            # If bar is >240s (4 mins), it's reliable enough for an "early-look" entry.
+            if bar_age_seconds < 240 and len(feature_df) > 2:
+                self.logger.debug(f"Current 5-min candle only {bar_age_seconds:.0f}s old. Using previous bar for {name}.")
+                current_features_row = feature_df.iloc[[-2]].copy()
+                latest_date = feature_df.index[-2]
+            else:
+                if bar_age_seconds >= 240:
+                    self.logger.info(f"Using 4-minute 'Early Look' on current bar for {name} ({bar_age_seconds:.0f}s old).")
+                current_features_row = feature_df.iloc[[-1]].copy()
+                latest_date = feature_df.index[-1]
+
             raw_df.index = pd.to_datetime(raw_df.index)
-            current_price = raw_df.loc[latest_date, 'Close']
+            current_price = raw_df['Close'].iloc[-1]  # Always use latest live price for entry
+
+            # Fix 6: India VIX Integration
+            # Reduce or halt trading when market fear is elevated.
+            try:
+                vix_df = self.data_fetcher.fetch_data('^INDIAVIX', period='5d')
+                if vix_df is not None and not vix_df.empty:
+                    india_vix = vix_df['Close'].iloc[-1]
+                    if india_vix > 25:
+                        self.logger.warning(f"India VIX = {india_vix:.1f} (>25). Extreme fear. Skipping {name}.")
+                        return {
+                            'index': name, 'position_size': 0, 
+                            'validation_reason': "High VIX (>25)", 
+                            'price': current_price, 'regime': regime
+                        }
+                    elif india_vix > 22:
+                        self.logger.info(f"India VIX = {india_vix:.1f} (>22). Elevated fear. Will reduce size for {name}.")
+                        # We'll halve position size downstream via a flag
+                        vix_size_multiplier = 0.5
+                    else:
+                        vix_size_multiplier = 1.0
+                else:
+                    vix_size_multiplier = 1.0  # VIX data unavailable, proceed normally
+            except Exception as e:
+                self.logger.debug(f"Could not fetch India VIX: {e}. Proceeding normally.")
+                vix_size_multiplier = 1.0
 
             # Get ATR
             atr = 0
@@ -1441,7 +1464,19 @@ class TradingBot:
             elif 'atr_ratio' in current_features_row.columns:
                  atr = float(current_features_row['atr_ratio'].iloc[0]) * current_price
             else:
-                 atr = current_price * 0.01 # Fallback
+                 try:
+                     # Calculate actual 14-period ATR using raw 5-minute data
+                     high = raw_df['High']
+                     low = raw_df['Low']
+                     close = raw_df['Close']
+                     tr = pd.concat([
+                         high - low,
+                         (high - close.shift()).abs(),
+                         (low - close.shift()).abs()
+                     ], axis=1).max(axis=1)
+                     atr = float(tr.rolling(14).mean().iloc[-1])
+                 except Exception:
+                     atr = current_price * 0.002 # Fallback to 0.2% for intraday
 
             # 4. Neural/ML Prediction
             required_features = model_pack.get("features", [])
@@ -1450,48 +1485,235 @@ class TradingBot:
             X_pred = X_pred.fillna(0).replace([np.inf, -np.inf], 0)
 
             base_models = model_pack.get("base_models", {})
-            meta_features = np.zeros((1, len(base_models)))
+            ordered_base_names = model_pack.get("ordered_base_names", list(base_models.keys()))
+
+            # Fix: Ensure meta_features order precisely aligns with OOF training order
+            is_multiclass = Config.TARGET_MODE == 'three_class'
+            num_base_classes = 3 if is_multiclass else 1
+            meta_features = np.zeros((1, len(ordered_base_names) * num_base_classes))
             
-            for i, (mname, model) in enumerate(base_models.items()):
-                try:
-                    meta_features[0, i] = 0.5
-                    if hasattr(model, 'predict_proba'):
-                        prob = model.predict_proba(X_pred)
-                        if prob.shape[1] == 2:
-                            meta_features[0, i] = prob[0, 1]
-                        elif prob.shape[1] == 1:
-                            meta_features[0, i] = prob[0, 0]
-                except Exception as e:
-                     self.logger.warning(f"Base model {mname} prediction failed: {e}")
-                     pass
+            for i, mname in enumerate(ordered_base_names):
+                if mname in base_models:
+                    model = base_models[mname]
+                    try:
+                        if hasattr(model, 'predict_proba'):
+                            prob = model.predict_proba(X_pred)[0]
+                            if is_multiclass:
+                                for c_idx in range(3):
+                                    meta_features[0, i * 3 + c_idx] = prob[c_idx]
+                            else:
+                                meta_features[0, i] = prob[1] if len(prob) > 1 else prob[0]
+                        else:
+                            # Fallback if no proba
+                            if is_multiclass:
+                                meta_features[0, i * 3 + 2] = 1.0 # Default to Neutral
+                            else:
+                                meta_features[0, i] = 0.5
+                    except Exception as e:
+                         self.logger.warning(f"Base model {mname} prediction failed: {e}")
 
             calibrator = model_pack.get("calibrator") or model_pack.get("meta_clf")
+            
+            # Probability and Direction Logic (3-Class Aware)
+            direction = None
             probability = 0.5
+            ml_conviction = 0.0
+            
             if calibrator:
                 try:
-                    probability = calibrator.predict_proba(meta_features)[0, 1]
-                except:
-                    probability = 0.5
-
-            # 5. Core Direction Logic
-            confidence_threshold = regime_params.get('confidence_threshold', Config.CONFIDENCE_THRESHOLD)
-            direction = None
-            if probability >= confidence_threshold:
-                direction = "CE"
-            elif probability <= (1.0 - confidence_threshold):
-                direction = "PE"
+                    probs = calibrator.predict_proba(meta_features)[0]
+                    if is_multiclass and len(probs) >= 3:
+                        # Index Mapping from improved_targets: 0: BEAR, 1: BULL, 2: NEUTRAL
+                        bear_prob = probs[0]
+                        bull_prob = probs[1]
+                        neutral_prob = probs[2]
+                        
+                        confidence_threshold = regime_params.get('confidence_threshold', Config.CONFIDENCE_THRESHOLD)
+                        
+                        # Logic: Only trade if BULL or BEAR beats the opposite direction and exceeds threshold.
+                        # Do NOT require it to beat NEUTRAL, as sideways regimes often have high NEUT probabilities
+                        # even when an actionable directional setup exists. Let the validator decide.
+                        if bull_prob > bear_prob and bull_prob >= confidence_threshold:
+                            direction = "CE"
+                            probability = bull_prob
+                            ml_conviction = bull_prob - bear_prob
+                        elif bear_prob > bull_prob and bear_prob >= confidence_threshold:
+                            direction = "PE"
+                            probability = bear_prob
+                            ml_conviction = bear_prob - bull_prob
+                        else:
+                            self.logger.info(f"ML Neutral/Low Conviction for {name}: BULL={bull_prob:.2f}, BEAR={bear_prob:.2f}, NEUT={neutral_prob:.2f}")
+                            return {
+                                'index': name, 'position_size': 0, 
+                                'validation_reason': "ML Neutral/Low Conv", 
+                                'price': current_price, 'regime': regime,
+                                'confidence': max(probs)
+                            }
+                    else:
+                        # Binary fallback
+                        probability = probs[1] if len(probs) > 1 else probs[0]
+                        confidence_threshold = regime_params.get('confidence_threshold', Config.CONFIDENCE_THRESHOLD)
+                        if probability >= confidence_threshold:
+                            direction = "CE"
+                        elif (1.0 - probability) >= confidence_threshold:
+                             direction = "PE"
+                        ml_conviction = abs(probability - 0.5) * 2
+                            
+                except Exception as e:
+                    self.logger.warning(f"Inference failed for {name}: {e}")
+                    return {
+                        'index': name, 'position_size': 0, 
+                        'validation_reason': "ML Inference Error", 
+                        'price': current_price, 'regime': regime
+                    }
             
             if not direction:
-                 return None
+                 return {
+                    'index': name, 'position_size': 0, 
+                    'validation_reason': "No Directional Edge", 
+                    'price': current_price, 'regime': regime
+                }
+
+            # Fix 3: ML Confidence Hard Floor (with late-entry adjustment)
+            # If the ML model has essentially no conviction (probability near 0.5),
+            # the direction decision is unreliable regardless of validator approval.
+            ml_conviction_raw = abs(probability - 0.5)  # 0.0 = coin flip, 0.5 = perfect
+            ML_FLOOR = 0.02  # Minimum conviction (Lowered from 0.04)
+            
+            # After 3:00 PM, conviction needs minimal boost
+            if 'late_entry' in locals() and late_entry and minutes_to_close < 30:
+                required_conviction = ML_FLOOR * 1.05  # Lowered from 1.15
+                if ml_conviction_raw < required_conviction:
+                    self.logger.info(
+                        f"ML confidence too low for late entry on {name}: conviction={ml_conviction_raw:.3f} "
+                        f"(prob={probability:.3f}, required={required_conviction:.3f}). Skipping."
+                    )
+                    return {
+                        'index': name, 'position_size': 0,
+                        'validation_reason': f"Low Conviction for Late Entry (need {required_conviction:.2f})",
+                        'price': current_price, 'regime': regime,
+                        'confidence': probability
+                    }
+            
+            # Standard ML floor check
+            if ml_conviction_raw < ML_FLOOR:
+                self.logger.info(
+                    f"ML confidence too low for {name}: conviction={ml_conviction_raw:.3f} "
+                    f"(prob={probability:.3f}, floor={ML_FLOOR}). Skipping."
+                )
+                return {
+                    'index': name, 'position_size': 0, 
+                    'validation_reason': "ML Conviction < Floor", 
+                    'price': current_price, 'regime': regime,
+                    'confidence': probability
+                }
+
+            # Regime Alignment Check
+            # Prevent counter-trend trades in strong trending regimes
+            if regime == 'trending_up' and direction == 'PE':
+                self.logger.warning(f"Counter-trend PE signal BLOCKED in {regime} for {name}")
+                return {
+                    'index': name, 'position_size': 0,
+                    'validation_reason': f"Counter-trend PE in {regime}",
+                    'price': current_price, 'regime': regime
+                }
+            elif regime == 'trending_down' and direction == 'CE':
+                self.logger.warning(f"Counter-trend CE signal BLOCKED in {regime} for {name}")
+                return {
+                    'index': name, 'position_size': 0,
+                    'validation_reason': f"Counter-trend CE in {regime}",
+                    'price': current_price, 'regime': regime
+                }
+
+            # Fix 9: Cross-index correlation check (after direction is known)
+            open_positions = self.state.state.get('open_positions', {})
+            if len(open_positions) >= 2:
+                open_directions = [p.get('direction') for p in open_positions.values()]
+                if all(d == direction for d in open_directions):
+                    self.logger.warning(
+                        f"Correlation limit: All {len(open_positions)} open positions are {direction}. "
+                        f"Skipping correlated {direction} entry for {name}."
+                    )
+                    return {
+                        'index': name, 'position_size': 0, 
+                        'validation_reason': "Correlation Limit", 
+                        'price': current_price, 'regime': regime,
+                        'direction': direction
+                    }
+
+            # Fix 6: Momentum Exhaustion Detection
+            # NOTE: RSI divergence is also checked in SignalValidator._evaluate_momentum() with -40 penalty
+            # We removed the hard block here to avoid double-penalty. The validator's score penalty is sufficient.
+            # If RSI exhaustion is severe, validator will score < threshold and trade will be rejected.
+
+            # ADX Hard Gate: Require minimum trend strength for directional trades
+            adx_col = 'trend_adx' if 'trend_adx' in feature_df.columns else None
+            if adx_col:
+                current_adx = feature_df[adx_col].iloc[-1]
+            else:
+                # Fallback ADX calculation if column missing
+                try:
+                    high = feature_df['High']
+                    low = feature_df['Low']
+                    close = feature_df['Close']
+                    plus_dm = high.diff().clip(lower=0)
+                    minus_dm = (-low.diff()).clip(lower=0)
+                    tr = pd.concat([
+                        high - low,
+                        (high - close.shift()).abs(),
+                        (low - close.shift()).abs()
+                    ], axis=1).max(axis=1)
+                    atr14 = tr.rolling(14).mean()
+                    plus_di = 100 * (plus_dm.rolling(14).mean() / atr14)
+                    minus_di = 100 * (minus_dm.rolling(14).mean() / atr14)
+                    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di))
+                    current_adx = dx.rolling(14).mean().iloc[-1]
+                    self.logger.debug(f"Fallback ADX calculated for {name}: {current_adx:.1f}")
+                except Exception:
+                    current_adx = 0  # Cannot compute → fail closed (block trade)
+                    self.logger.warning(f"ADX unavailable for {name}. Blocking trade (fail-safe).")
+            
+            adx_threshold = regime_params.get('adx_min', 20)
+            if current_adx < adx_threshold:
+                self.logger.info(
+                    f"ADX too low for directional trade on {name}: ADX={current_adx:.1f} < {adx_threshold}. Skipping."
+                )
+                return {
+                    'index': name, 'position_size': 0, 
+                    'validation_reason': f"ADX Low ({current_adx:.1f})", 
+                    'price': current_price, 'regime': regime
+                }
 
             # Determine Direction for logging
             log_direction = "\033[92mCE\033[0m" if direction == "CE" else "\033[91mPE\033[0m"
             self.logger.info(f"ML Direction: {log_direction} (Conf: {probability:.3f})")
 
             # 6. Signal Validation (Deep Analysis)
+            # Fix 5: Scale validator threshold based on ML confidence
+            # Low ML confidence → require higher validator score
             if getattr(self, 'signal_validator', None):
                 context = {'regime': regime, 'regime_params': regime_params}
                 temp_signal = {'direction': direction, 'price': current_price, 'confidence': probability}
+                
+                # Dynamic threshold scaling: More gradual scaling to prevent over-rejection
+                base_threshold = self.signal_validator.config.get('min_score', 70)
+                
+                if ml_conviction < 0.05:  # Lowered from 0.10
+                    self.signal_validator.min_score = base_threshold + 2   # Lowered from +5
+                elif ml_conviction < 0.10:
+                    self.signal_validator.min_score = base_threshold + 0   # Lowered from +2
+                elif ml_conviction < 0.15:
+                    self.signal_validator.min_score = base_threshold + 0   # Lowered from +0
+                else:
+                    self.signal_validator.min_score = base_threshold
+                
+                # Additional late-entry penalty removed to allow catching late afternoon momentum
+                if 'late_entry' in locals() and late_entry:
+                    self.logger.debug(f"Late entry detected. Softened rules let this proceed with standard threshold {self.signal_validator.min_score}")
+                
+                # Boost threshold on expiry days
+                if expiry_adj and expiry_adj.get('validator_threshold_boost', 0) > 0:
+                    self.signal_validator.min_score += expiry_adj['validator_threshold_boost']
                 
                 is_valid, score, reason = self.signal_validator.validate_trade_setup(
                     signal=temp_signal,
@@ -1499,22 +1721,29 @@ class TradingBot:
                     context=context
                 )
                 
+                # Restore default min_score
+                self.signal_validator.min_score = self.signal_validator.config.get('min_score', 70)
+                
                 # Re-assign colored direction for logging
                 log_direction = "\033[92mCE\033[0m" if direction == "CE" else "\033[91mPE\033[0m"
 
                 if not is_valid:
                     self.logger.info(f"Signal REJECTED by Validator: {name} {log_direction} | Score: {score:.1f} | Reason: {reason}")
-                    # return None <-- CHANGED: Return signal but inactive
                     position_size = 0.0
                 else:
                     self.logger.info(f"Signal \033[92mAPPROVED\033[0m by Validator: {name} {log_direction} | Score: {score:.1f} | Reason: {reason}")
                     position_size = 1.0 # Will be recalculated by risk manager
+            else:
+                # Fail-safe: If validator is unavailable, reject trade
+                # Without scoring, VWAP blocks, and regime checks, trade quality is unverifiable.
+                self.logger.warning(f"Signal validator unavailable for {name}. Blocking trade (fail-safe).")
+                return {
+                    'index': name, 'position_size': 0, 
+                    'validation_reason': "Validator Missing", 
+                    'price': current_price, 'regime': regime
+                }
             
             # 7. Risk Management & Exits
-            # Even if rejected, we calculate potential exits for display purposes if possible
-            # But normally we only calc exits if we are entering. 
-            # Let's do a lightweight calculation or use risk manager with size=0
-            
             risk_amount = 0
             exits = {}
             
@@ -1528,27 +1757,69 @@ class TradingBot:
                     pos_info['position_size'] = 0.0
                 
                 position_size = pos_info['position_size']
-                risk_amount = pos_info['risk_amount']
-                stop_distance = pos_info.get('stop_distance', atr * 2) # Fallback
                 
-                # Calculate Stops/Targets for Display
-                if direction == "CE":
-                    exits['stop_loss'] = current_price - stop_distance
-                    exits['tp1'] = current_price + (stop_distance * 1.5)
-                    exits['tp2'] = current_price + (stop_distance * 3.0)
-                else: 
-                    exits['stop_loss'] = current_price + stop_distance
-                    exits['tp1'] = current_price - (stop_distance * 1.5)
-                    exits['tp2'] = current_price - (stop_distance * 3.0)
+                # Apply VIX-based size reduction if applicable
+                if 'vix_size_multiplier' in locals() and vix_size_multiplier < 1.0:
+                    position_size = int(position_size * vix_size_multiplier)
+                    self.logger.info(f"VIX size reduction applied: position_size = {position_size}")
+                
+                # Apply expiry day size reduction
+                if expiry_adj and expiry_adj.get('position_size_multiplier', 1.0) < 1.0:
+                    position_size = int(position_size * expiry_adj['position_size_multiplier'])
+                    self.logger.info(f"Expiry size reduction: position_size = {position_size}")
+                
+                risk_amount = pos_info['risk_amount']
+                
+                # Calculate actual Stops/Targets using Risk Manager
+                # Now passes regime and current_hour for adaptive TP/SL (Fixes 10, 12)
+                current_hour = datetime.now(Config.TIMEZONE).hour
+                exits = self.risk_manager.calculate_exits(
+                     entry_price=current_price,
+                     direction=direction,
+                     atr=atr,
+                     df=feature_df,
+                     regime=regime,
+                     current_hour=current_hour
+                )
+                
+                # Slippage & Execution Friction Buffer
+                # Options typically have 1-2 pt slippage per leg.
+                # Adjust TP inward and SL outward for realistic fills.
+                SLIPPAGE_PTS = 2.0
+                if direction == 'CE':
+                    exits['tp1'] = exits['tp1'] - SLIPPAGE_PTS
+                    exits['tp2'] = exits['tp2'] - SLIPPAGE_PTS
+                    exits['stop_loss'] = exits['stop_loss'] - SLIPPAGE_PTS
+                else:  # PE
+                    exits['tp1'] = exits['tp1'] + SLIPPAGE_PTS
+                    exits['tp2'] = exits['tp2'] + SLIPPAGE_PTS
+                    exits['stop_loss'] = exits['stop_loss'] + SLIPPAGE_PTS
+                
+                # Apply expiry day tightening to TP/SL
+                if expiry_adj:
+                    tp_tight = expiry_adj.get('tp_tightening', 1.0)
+                    sl_tight = expiry_adj.get('sl_tightening', 1.0)
+                    if tp_tight < 1.0:
+                        # Tighten TP toward entry
+                        tp1_dist = abs(exits['tp1'] - current_price)
+                        tp2_dist = abs(exits['tp2'] - current_price)
+                        if direction == 'CE':
+                            exits['tp1'] = current_price + tp1_dist * tp_tight
+                            exits['tp2'] = current_price + tp2_dist * tp_tight
+                        else:
+                            exits['tp1'] = current_price - tp1_dist * tp_tight
+                            exits['tp2'] = current_price - tp2_dist * tp_tight
+                    if sl_tight < 1.0:
+                        sl_dist = abs(exits['stop_loss'] - current_price)
+                        if direction == 'CE':
+                            exits['stop_loss'] = current_price - sl_dist * sl_tight
+                        else:
+                            exits['stop_loss'] = current_price + sl_dist * sl_tight
             
             # 8. Filter Check (Volume, etc - fallback if not using Validator)
             valid_signal = True
             if position_size <= 0:
                 valid_signal = False
-
-            # if probability < confidence_threshold: # Double check
-            #      valid_signal = False
-            #      position_size = 0
 
             # 9. Construct Final Signal
             signal = {
@@ -1571,58 +1842,6 @@ class TradingBot:
             # Print Actionable Signal Card ONLY if approved
             if position_size > 0:
                 self.print_signal_card(signal)
-
-            return signal
-                
-
-
-            # 8. TradingView Validation
-            if self.tradingview_validator:
-                self.tradingview_validator.validate_signal(
-                    signal={
-                        'index': name,
-                        'direction': direction,
-                        'price': current_price,
-                        'confidence': probability,
-                        'time': datetime.now(Config.TIMEZONE).strftime("%H:%M:%S"),
-                        'atr_ratio': atr / current_price if current_price > 0 else 0,
-                        'regime': regime
-                    },
-                    symbol=symbol,
-                    interval=Config.INTERVAL
-                )
-
-            # 9. Construct Final Signal
-            # Calculate Strike and Expiry
-            strike = self._get_atm_strike(name, current_price)
-            expiry = self._get_next_expiry(name)
-            contract_name = f"{name} {expiry.strftime('%d %b').upper()} {strike} {direction}"
-            
-            signal = {
-                'index': name,
-                'direction': direction,
-                'price': current_price,
-                'confidence': probability,
-                'time': datetime.now(Config.TIMEZONE).strftime("%H:%M:%S"),
-                'regime': regime,
-                'atr': atr,
-                'position_size': position_size,
-                'risk_amount': risk_amount,
-                'stop_loss': exits.get('stop_loss'),
-                'take_profit_1': exits.get('tp1'),
-                'take_profit_2': exits.get('tp2'),
-                'validation_score': score if 'score' in locals() else None,
-                'validation_reason': reason if 'reason' in locals() else "Low Confidence",
-                'strike': strike,
-                'expiry': expiry.strftime('%d %b %Y'),
-                'contract': contract_name
-            }
-            
-            # Print Actionable Signal Card ONLY if approved
-            if position_size > 0:
-                self.print_signal_card(signal)
-
-            return signal
 
             return signal
 
@@ -1657,6 +1876,13 @@ class TradingBot:
         action_color = GREEN if direction == "CE" else RED
         action_text = "BUY CALL (CE)" if direction == "CE" else "BUY PUT (PE)"
         
+        # Calculate the 1:1 R:R trailing trigger price
+        risk = abs(price - sl)
+        if direction == "CE":
+            trail_trigger = price + risk  # 1:1 R:R for longs
+        else:
+            trail_trigger = price - risk  # 1:1 R:R for shorts
+        
         print(f"\n{border_color}" + "="*60 + f"{RESET}")
         print(f"{border_color}║ {BOLD}⚡ TRADE SIGNAL ALERT: {name:<30}{RESET} {border_color}║{RESET}")
         print(f"{border_color}" + "="*60 + f"{RESET}")
@@ -1664,10 +1890,11 @@ class TradingBot:
         print(f"{border_color}║ {RESET}Entry Price: {CYAN}{price:<.2f}{RESET}{' '*30} {border_color}║{RESET}")
         print(f"{border_color}║ {RESET}Stop Loss:   {YELLOW}{sl:<.2f}{RESET} (Structural/ATR){' '*16} {border_color}║{RESET}")
         print(f"{border_color}║ {RESET}Target 1:    {GREEN}{tp1:<.2f}{RESET}{' '*30} {border_color}║{RESET}")
-        print(f"{border_color}║ {RESET}Target 1:    {GREEN}{tp1:<.2f}{RESET}{' '*30} {border_color}║{RESET}")
         print(f"{border_color}║ {RESET}Target 2:    {GREEN}{tp2:<.2f}{RESET} (Runner){' '*21} {border_color}║{RESET}")
         print(f"{border_color}║ {RESET}Contract:    {BOLD}{contract:<38}{RESET} {border_color}║{RESET}")
         print(f"{border_color}║ {RESET}Confidence:  {conf:<.1f}% | Score: {score:.1f}/100{' '*16} {border_color}║{RESET}")
+        print(f"{border_color}" + "-"*60 + f"{RESET}")
+        print(f"{border_color}║ {YELLOW}⚠️  TRAIL SL to Entry ({price:.2f}) when price hits {trail_trigger:.2f}{RESET}")
         print(f"{border_color}" + "="*60 + f"{RESET}\n")
 
     def _get_atm_strike(self, index_name: str, spot_price: float) -> int:
@@ -1769,6 +1996,7 @@ class TradingBot:
             status_color = RESET
             if "APPROVED" in status or "OPEN" in status: status_color = GREEN
             elif "REJECTED" in status: status_color = RED
+            elif "FILTERED" in status: status_color = CYAN
             elif "Error" in status: status_color = YELLOW
             
             # Additional formatting
@@ -1841,14 +2069,20 @@ class TradingBot:
             signal = self.generate_signal(name, symbol)
             
             if not signal:
-                 return {'index': name, 'status': 'No Signal/Data'}
+                 return {'index': name, 'status': 'No Signal/Data', 'reason': 'Fetch/Feat Err'}
             
             # Setup for dashboard return
             status = "Waiting"
-            if signal.get('position_size', 0) > 0: status = "APPROVED"
-            elif 'validation_score' in signal: status = "REJECTED"
+            if signal.get('position_size', 0) > 0: 
+                status = "APPROVED"
+            elif signal.get('validation_reason'):
+                # Distinguish between high-score rejection and early filtering
+                if signal.get('validation_score') is not None:
+                    status = "REJECTED"
+                else:
+                    status = "FILTERED"
             
-            if signal and signal.get('position_size', 0) > 0:
+            if signal.get('position_size', 0) > 0:
                 self._execute_entry(name, symbol, signal, limit_status)
             
             return {
@@ -1870,14 +2104,8 @@ class TradingBot:
             return {'index': name, 'status': 'Error'}
 
     def _monitor_position(self, name: str, symbol: str, position: Dict):
-        """Monitor an open position for exit conditions."""
+        """Monitor an open position for exit conditions with emergency breach detection."""
         try:
-            # Get latest price
-            # Using 5m data for monitoring to get more granular price action
-            # or just fetch 1d if EOD. Let's stick to 1d for consistency with signal gen for now,
-            # but in a real system we'd stream live ticks.
-            # Using data_fetcher defaults which might be 1d. 
-            # Ideally this should check live price.
             raw_df = self.data_fetcher.fetch_data(symbol, period="1d")
             
             if raw_df.empty:
@@ -1892,9 +2120,122 @@ class TradingBot:
             tp = position.get('tp', position.get('take_profit_1', position.get('take_profit')))
             size = position.get('position_size', position.get('size', 0))
             
+            # Emergency SL Breach Detection
+            # If price has blown past SL by > 1.5× intended risk, trigger immediate exit
+            # and log as emergency event for post-trade analysis.
+            if sl is not None:
+                intended_risk = abs(entry_price - sl)
+                if direction == 'CE':
+                    actual_breach = sl - current_price  # Positive if below SL
+                else:  # PE
+                    actual_breach = current_price - sl  # Positive if above SL
+                
+                if actual_breach > 0:
+                    breach_multiple = actual_breach / intended_risk if intended_risk > 0 else 0
+                    if breach_multiple > Config.EMERGENCY_SL_MULTIPLIER:
+                        # Price has moved far past SL — emergency exit
+                        if direction == 'CE':
+                            pnl = (current_price - entry_price) * size
+                        else:
+                            pnl = (entry_price - current_price) * size
+                        
+                        # Deduct transaction costs
+                        lot_count = max(1, size // 25)  # Approx lots
+                        tx_cost = lot_count * Config.TRANSACTION_COST_PER_LOT
+                        net_pnl = pnl - tx_cost
+                        
+                        self.logger.critical(
+                            f"🚨 EMERGENCY SL BREACH for {name}: Price={current_price:.2f}, "
+                            f"SL={sl:.2f}, Breach={breach_multiple:.1f}× risk. "
+                            f"Gross P&L: {pnl:.2f}, Net P&L (after ₹{tx_cost} costs): {net_pnl:.2f}"
+                        )
+                        
+                        if self.performance_tracker:
+                            self.performance_tracker.update_trade_exit(
+                                trade_id=position['trade_id'],
+                                exit_price=current_price,
+                                exit_reason='EMERGENCY_SL_BREACH',
+                                pnl=net_pnl
+                            )
+                        
+                        self.state.remove_position(name)
+                        self.state.update_daily_stats(net_pnl)
+                        self.logger.info(f"Emergency exit complete for {name}.")
+                        return
+            # Fix 10: Automated Trailing Stop
+            # Move SL to breakeven (entry price) once 1:1 R:R is achieved.
+            if sl is not None:
+                risk = abs(entry_price - sl)
+                if direction == "CE" and current_price >= entry_price + risk:
+                    new_sl = entry_price
+                    if sl < new_sl:  # Only move SL up, never down
+                        self.logger.info(f"📈 Trailing SL to breakeven for {name}: {sl:.2f} → {new_sl:.2f}")
+                        position['sl'] = new_sl
+                        sl = new_sl
+                        self.state.save_state()  # Persist the updated SL
+                elif direction == "PE" and current_price <= entry_price - risk:
+                    new_sl = entry_price
+                    if sl > new_sl:  # Only move SL down, never up
+                        self.logger.info(f"📉 Trailing SL to breakeven for {name}: {sl:.2f} → {new_sl:.2f}")
+                        position['sl'] = new_sl
+                        sl = new_sl
+                        self.state.save_state()  # Persist the updated SL
+
             # Check Exit Conditions
             exit_reason = None
             pnl = 0.0
+            
+            # Fix 11: Partial Profit Booking at TP1
+            # If the position hasn't already been partially closed, book 50% at TP1
+            # and trail SL to entry for the remaining half.
+            tp2 = position.get('tp2', position.get('take_profit_2'))
+            already_partial = position.get('partial_booked', False)
+            
+            if not already_partial and tp is not None and size > 1:
+                partial_hit = False
+                if direction == "CE" and current_price >= tp:
+                    partial_hit = True
+                elif direction == "PE" and current_price <= tp:
+                    partial_hit = True
+                
+                if partial_hit:
+                    # Book 50% of position at TP1
+                    partial_size = max(1, size // 2)
+                    remaining_size = size - partial_size
+                    
+                    if direction == "CE":
+                        partial_pnl = (current_price - entry_price) * partial_size
+                    else:
+                        partial_pnl = (entry_price - current_price) * partial_size
+                    
+                    self.logger.info(
+                        f"💰 Partial profit booked for {name}: {partial_size} qty at {current_price:.2f}. "
+                        f"P&L: {partial_pnl:.2f}. Remaining: {remaining_size} qty"
+                    )
+                    
+                    # Update position: trail SL to entry, set new TP to TP2, mark partial booked
+                    position['position_size'] = remaining_size
+                    position['sl'] = entry_price  # Trail SL to breakeven
+                    sl = entry_price
+                    if tp2:
+                        position['tp'] = tp2  # Move target to TP2
+                        tp = tp2
+                    position['partial_booked'] = True
+                    size = remaining_size
+                    
+                    # Log partial trade to performance tracker
+                    if self.performance_tracker:
+                        self.performance_tracker.update_trade_exit(
+                            trade_id=position['trade_id'] + '_partial',
+                            exit_price=current_price,
+                            exit_reason='Partial_TP1',
+                            pnl=partial_pnl
+                        )
+                    
+                    # Update daily stats with partial P&L
+                    self.state.update_daily_stats(partial_pnl)
+                    self.state.save_state()
+                    return  # Don't check full exit conditions this cycle
             
             if direction == "CE":
                 if current_price <= sl:
@@ -1907,8 +2248,6 @@ class TradingBot:
                 elif current_price <= tp:
                     exit_reason = "Take Profit"
             
-            # Check for Time-based exit or Regime change (optional - future enhancement)
-            
             if exit_reason:
                 # Calculate P&L
                 if direction == "CE":
@@ -1916,7 +2255,15 @@ class TradingBot:
                 else:
                     pnl = (entry_price - current_price) * size
                 
-                self.logger.info(f"Closing {direction} position for {name} ({symbol}) at {current_price}. Reason: {exit_reason}. P&L: {pnl:.2f}")
+                # Deduct transaction costs for net P&L
+                lot_count = max(1, size // 25)
+                tx_cost = lot_count * Config.TRANSACTION_COST_PER_LOT
+                net_pnl = pnl - tx_cost
+                
+                self.logger.info(
+                    f"Closing {direction} position for {name} ({symbol}) at {current_price}. "
+                    f"Reason: {exit_reason}. Gross P&L: {pnl:.2f}, Net P&L: {net_pnl:.2f} (after ₹{tx_cost} costs)"
+                )
                 
                 # Update Risk Manager
                 if self.risk_manager:
@@ -1931,15 +2278,16 @@ class TradingBot:
                         trade_id=position['trade_id'],
                         exit_price=current_price,
                         exit_reason=exit_reason,
-                        pnl=pnl
+                        pnl=net_pnl
                     )
                 
-                # Update State
-                self.state.remove_position(symbol)
-                self.state.update_daily_stats(pnl)
+                # Update State — use `name` (e.g., 'NIFTY') not `symbol` (e.g., '^NSEI')
+                # This matches how execute_trade_lifecycle looks up positions by name.
+                self.state.remove_position(name)
+                self.state.update_daily_stats(net_pnl)
                 
                 # Notify User (via log)
-                self.logger.info(f"Trade Closed: {name} {direction} | P&L: {pnl:.2f}")
+                self.logger.info(f"Trade Closed: {name} {direction} | Net P&L: {net_pnl:.2f}")
 
         except Exception as e:
             self.logger.error(f"Error monitoring position for {name}: {e}")
@@ -1964,10 +2312,13 @@ class TradingBot:
                 return
 
             # Log Trade
-            trade_id = f"{name}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            # Generate a temporary string ID for logging before we get the DB ID
+            temp_trade_id = f"{name}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            final_trade_id = temp_trade_id 
+
             if self.performance_tracker:
-                 self.performance_tracker.log_trade(
-                    trade_id=trade_id,
+                 db_id = self.performance_tracker.log_trade(
+                    trade_id=temp_trade_id,
                     index_name=name, # Changed param name to match tracker
                     direction=direction,
                     entry_price=current_price,
@@ -1983,19 +2334,22 @@ class TradingBot:
                     },
                     validation_score=signal.get('validation_score')
                 )
+                 if db_id:
+                     final_trade_id = db_id # Store the integer ID for database updates
             
             # Save to State
             position_data = {
-                "trade_id": trade_id,
+                "trade_id": final_trade_id,
                 "entry_price": current_price,
                 "direction": direction,
                 "position_size": size, # Standardized key
                 "sl": sl,
                 "tp": tp,
+                "tp2": signal.get('take_profit_2'),  # Needed for partial profit booking
                 "entry_time": datetime.now().isoformat(),
                 "regime": signal['regime']
             }
-            self.state.add_position(symbol, position_data)
+            self.state.add_position(name, position_data)  # Use name, not symbol
             
             self.logger.info(f"🚀 OPENED {direction} for {name} @ {current_price} | Size: {size} | SL: {sl} | TP: {tp}")
 
@@ -2004,7 +2358,7 @@ class TradingBot:
 
     @staticmethod
     def is_market_open() -> bool:
-        """Check if market is open (IST)."""
+        """Check if market is open (IST). Avoids opening chop and closing volatility."""
         now = datetime.now(Config.TIMEZONE)
         # Check for weekends (Saturday=5, Sunday=6)
         if now.weekday() >= 5:
@@ -2014,10 +2368,10 @@ class TradingBot:
         market_start_time = datetime.strptime(Config.MARKET_START, "%H:%M").time()
         market_end_time = datetime.strptime(Config.MARKET_END, "%H:%M").time()
 
-        # Add a small buffer to avoid issues right at the open/close
-        # e.g., check from 09:16 to 15:29
-        check_start_time = (datetime.combine(datetime.today(), market_start_time) + timedelta(minutes=1)).time()
-        check_end_time = (datetime.combine(datetime.today(), market_end_time) - timedelta(minutes=1)).time()
+        # Shield: Skip the opening 15 minutes (09:15-09:30) for erratic overnight unwind
+        # Shield: Skip the last 15 minutes (15:15-15:30) for closing square-off volatility
+        check_start_time = (datetime.combine(datetime.today(), market_start_time) + timedelta(minutes=15)).time()
+        check_end_time = (datetime.combine(datetime.today(), market_end_time) - timedelta(minutes=15)).time()
 
         return check_start_time <= now.time() < check_end_time # Use strict less than for end time
 
@@ -2040,6 +2394,26 @@ class TradingBot:
             try:
                 current_time = datetime.now(Config.TIMEZONE)
 
+                # Clean up overnight positions if any exist (e.g. from previous days)
+                open_positions = dict(self.state.state.get('open_positions', {}))
+                for pos_name, pos_data in open_positions.items():
+                    entry_time_str = pos_data.get('entry_time')
+                    if entry_time_str:
+                        try:
+                            entry_dt = datetime.fromisoformat(entry_time_str)
+                            if entry_dt.date() < current_time.date():
+                                self.logger.warning(f"🧹 Stale overnight position detected for {pos_name}. Closing it to allow new trades today.")
+                                if getattr(self, 'performance_tracker', None):
+                                    self.performance_tracker.update_trade_exit(
+                                        trade_id=pos_data.get('trade_id', pos_name),
+                                        exit_price=pos_data.get('entry_price', 0.0),
+                                        exit_reason='STALE_OVERNIGHT_CLEANUP',
+                                        pnl=0.0
+                                    )
+                                self.state.remove_position(pos_name)
+                        except Exception as e:
+                            self.logger.debug(f"Error checking position age for {pos_name}: {e}")
+
                 if Config.USE_EOD_SIGNALS:
                     # EOD mode: wait until after market close and trigger only once per day
                     if self.is_market_open():
@@ -2061,6 +2435,52 @@ class TradingBot:
                         consecutive_run_errors = 0 # Reset error count when waiting for market
                         continue
 
+                # Fix 2: Auto-square-off at 15:10 IST
+                # Close all open positions to prevent overnight gap risk.
+                # Index options decay overnight (theta) and gap risk is unhedgeable.
+                if current_time.hour == 15 and current_time.minute >= 10:
+                    open_positions = dict(self.state.state.get('open_positions', {}))
+                    if open_positions:
+                        self.logger.info(f"🔔 Auto-square-off triggered at 15:10 IST. Closing {len(open_positions)} open positions.")
+                        for pos_name, pos_data in open_positions.items():
+                            try:
+                                symbol = Config.INDICES.get(pos_name, pos_name)
+                                raw_df = self.data_fetcher.fetch_data(symbol, period="1d")
+                                if not raw_df.empty:
+                                    exit_price = raw_df['Close'].iloc[-1]
+                                else:
+                                    exit_price = pos_data['entry_price']  # Fallback
+                                
+                                entry_price = pos_data['entry_price']
+                                direction = pos_data['direction']
+                                size = pos_data.get('position_size', pos_data.get('size', 0))
+                                
+                                if direction == 'CE':
+                                    pnl = (exit_price - entry_price) * size
+                                else:
+                                    pnl = (entry_price - exit_price) * size
+                                
+                                self.logger.info(
+                                    f"⏹️ EOD Square-off: {pos_name} {direction} | "
+                                    f"Entry: {entry_price:.2f} → Exit: {exit_price:.2f} | P&L: {pnl:.2f}"
+                                )
+                                
+                                if self.performance_tracker:
+                                    self.performance_tracker.update_trade_exit(
+                                        trade_id=pos_data.get('trade_id', pos_name),
+                                        exit_price=exit_price,
+                                        exit_reason='EOD_SQUAREOFF',
+                                        pnl=pnl
+                                    )
+                                
+                                self.state.remove_position(pos_name)
+                                self.state.update_daily_stats(pnl)
+                                
+                            except Exception as e:
+                                self.logger.error(f"Error during EOD square-off for {pos_name}: {e}")
+                        
+                        self.logger.info("✅ EOD square-off complete. All positions closed.")
+                
                 # Proceed with scanning
                 self.logger.info("Market open. Executing trade lifecycle...")
                 
@@ -2079,12 +2499,31 @@ class TradingBot:
                 self.print_dashboard(cycle_results)
 
                 # Sleep
+                # Split-interval sleep: fast-poll open positions every MONITOR_INTERVAL,
+                # full lifecycle scan every POLL_INTERVAL. Worst-case SL delay = MONITOR_INTERVAL.
                 poll_interval = Config.POLL_INTERVAL
-                self.logger.info(f"Lifecycle completed. Sleeping for {poll_interval}s.")
+                monitor_interval = Config.MONITOR_INTERVAL
+                self.logger.info(f"Lifecycle completed. Next full scan in {poll_interval}s. Monitoring every {monitor_interval}s.")
                 
-                # Provide visual feedback during sleep
-                print(f"⏳ Sleeping for {poll_interval}s...", end="", flush=True)
-                time.sleep(poll_interval)
+                elapsed = 0
+                while elapsed < poll_interval:
+                    remaining = poll_interval - elapsed
+                    sleep_time = min(monitor_interval, remaining)
+                    
+                    print(f"\r⏳ Next scan in {remaining}s (monitoring active)...", end="", flush=True)
+                    time.sleep(sleep_time)
+                    elapsed += sleep_time
+                    
+                    # Fast-poll: check open positions only (no signal generation)
+                    open_positions = dict(self.state.state.get('open_positions', {}))
+                    if open_positions:
+                        for pos_name, pos_data in open_positions.items():
+                            try:
+                                pos_symbol = Config.INDICES.get(pos_name, pos_name)
+                                if pos_symbol:
+                                    self._monitor_position(pos_name, pos_symbol, pos_data)
+                            except Exception as e:
+                                self.logger.error(f"Fast-poll monitor error for {pos_name}: {e}")
                 print("\r" + " "*30 + "\r", end="", flush=True) # Clear line
 
             except KeyboardInterrupt:
@@ -2160,7 +2599,7 @@ class TradingBot:
                     'base_models': list(model_pack.get('base_models', {}).keys()),
                     'has_calibrator': 'calibrator' in model_pack and model_pack['calibrator'] is not model_pack.get('meta_clf'), # Check if it's a real calibrator
                     'cv_scores_count': len(model_pack.get('cv_scores', [])),
-                    'avg_cv_auc': np.mean([score['auc'] for score in model_pack.get('cv_scores', []) if isinstance(score.get('auc'), (int, float)) and score.get('fold') != 'Overall_OOF']) if model_pack.get('cv_scores') else np.nan,
+                    'avg_cv_auc': (lambda aucs: np.mean(aucs) if aucs else np.nan)([score['auc'] for score in model_pack.get('cv_scores', []) if isinstance(score.get('auc'), (int, float)) and score.get('fold') != 'Overall_OOF']) if model_pack.get('cv_scores') else np.nan,
                     'overall_oof_auc_calibrated': next((score['auc'] for score in model_pack.get('cv_scores', []) if score.get('fold') == 'Overall_OOF'), np.nan),
                     'last_trained': datetime.fromtimestamp(os.path.getmtime(os.path.join(Config.MODEL_DIR, f"{name}_model.joblib"))).strftime('%Y-%m-%d %H:%M:%S') if os.path.exists(os.path.join(Config.MODEL_DIR, f"{name}_model.joblib")) else 'N/A'
                 }

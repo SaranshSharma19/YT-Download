@@ -127,6 +127,7 @@ class RegimeDetector:
             
             # Regime classification logic
             regime = self._classify_regime(
+                df=df,
                 adx=adx,
                 choppiness=choppiness,
                 di_pos=di_pos,
@@ -152,6 +153,7 @@ class RegimeDetector:
     
     def _classify_regime(
         self,
+        df: pd.DataFrame,
         adx: float,
         choppiness: float,
         di_pos: float,
@@ -182,12 +184,14 @@ class RegimeDetector:
         is_sideways = (adx < 20) or (choppiness > 60) or is_flat_slope
         
         # 3. Directional Bias
-        current_ema9 = df['Close'].ewm(span=9, adjust=False).mean().iloc[-1] if 'df' in locals() else ema20 # Optional: compute EMA9 if not passed, but we'll stick to mostly existing. We'll use EMA20 as proxy for short term.
+        current_ema9 = df['Close'].ewm(span=9, adjust=False).mean().iloc[-1]
         bullish_structure = (current_price > ema20) and (ema20 > ema50)
         bearish_structure = (current_price < ema20) and (ema20 < ema50)
 
         # 4. Crash/Dump detection
-        is_dumping = (current_price < ema20) and (ema20 < ema50) and (adx > 30)
+        # Use Rate of Change (ROC) for dump detection instead of lagging ADX
+        roc_5 = (df['Close'].iloc[-1] - df['Close'].iloc[-6]) / df['Close'].iloc[-6] * 100 if len(df) >= 6 else 0
+        is_dumping = (current_price < ema20) and (ema20 < ema50) and (roc_5 < -0.4)
 
         # Classification Tree
         
@@ -225,32 +229,38 @@ class RegimeDetector:
         """
         regime_params = {
             'trending_up': {
-                'confidence_threshold': 0.55, # Slightly higher confidence required
-                'adx_min': 20,
+                'confidence_threshold': 0.42, # Raised from 0.36
+                'adx_min': 14,
                 'num_filters': 2,
                 'description': 'Strong uptrend - Trend following'
             },
             'trending_down': {
-                'confidence_threshold': 0.55,
-                'adx_min': 20,
+                'confidence_threshold': 0.42, # Raised from 0.36
+                'adx_min': 14,
                 'num_filters': 2,
                 'description': 'Strong downtrend - Trend following'
             },
-            'choppy': {
-                'confidence_threshold': 0.70, # High confidence for choppy markets
+            'sideways': {
+                'confidence_threshold': 0.44, # Lowered from 0.48
                 'adx_min': 0,
                 'num_filters': 4,
+                'description': 'Sideways market - Trade suppression'
+            },
+            'choppy': {
+                'confidence_threshold': 0.42, # Lowered from 0.45
+                'adx_min': 0,
+                'num_filters': 3,
                 'description': 'Choppy market - High strictness'
             },
             'volatile': {
-                'confidence_threshold': 0.65,
-                'adx_min': 15,
+                'confidence_threshold': 0.38, # Lowered from 0.42
+                'adx_min': 10, # Lowered from 12
                 'num_filters': 3,
                 'description': 'High volatility - Moderate strictness'
             },
             'unknown': {
-                'confidence_threshold': 0.60,
-                'adx_min': 15,
+                'confidence_threshold': 0.38, # Lowered from 0.42
+                'adx_min': 10, # Lowered from 12
                 'num_filters': 3,
                 'description': 'Unknown regime - Conservative'
             }
