@@ -15,8 +15,24 @@ import logging
 
 logger = logging.getLogger('ExpiryUtils')
 
-# Known NSE holidays for 2026 (update annually)
-# Source: NSE circular
+# Known NSE holidays for 2025
+NSE_HOLIDAYS_2025 = {
+    date(2025, 1, 26),   # Republic Day
+    date(2025, 2, 26),   # Mahashivratri
+    date(2025, 3, 14),   # Holi
+    date(2025, 3, 31),   # Id-ul-Fitr (Ramadan Id)
+    date(2025, 4, 10),   # Shri Ram Navami
+    date(2025, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
+    date(2025, 4, 18),   # Good Friday
+    date(2025, 5, 1),    # Maharashtra Day
+    date(2025, 8, 15),   # Independence Day
+    date(2025, 10, 2),   # Mahatma Gandhi Jayanti
+    date(2025, 10, 21),  # Diwali-Laxmi Pujan
+    date(2025, 11, 5),   # Gurunanak Jayanti
+    date(2025, 12, 25),  # Christmas
+}
+
+# Known NSE holidays for 2026
 NSE_HOLIDAYS_2026 = {
     date(2026, 1, 26),   # Republic Day
     date(2026, 2, 26),   # Maha Shivaratri (Tentative)
@@ -42,6 +58,10 @@ NSE_HOLIDAYS_2026 = {
     date(2026, 12, 25),  # Christmas
 }
 
+# Combine holidays
+NSE_HOLIDAYS = NSE_HOLIDAYS_2025.union(NSE_HOLIDAYS_2026)
+HOLIDAYS_COVERED = {2025, 2026}
+
 # Expiry day for each index
 EXPIRY_CONFIG = {
     'NIFTY': {
@@ -63,7 +83,12 @@ def _is_trading_day(d: date) -> bool:
     """Check if a date is a valid trading day (not weekend, not holiday)."""
     if d.weekday() >= 5:  # Saturday=5, Sunday=6
         return False
-    if d in NSE_HOLIDAYS_2026:
+    
+    # Check if we have coverage for the year
+    if d.year not in HOLIDAYS_COVERED:
+        logger.warning(f"Holiday coverage missing for year {d.year}. Please update expiry_utils.py.")
+        
+    if d in NSE_HOLIDAYS:
         return False
     return True
 
@@ -153,6 +178,15 @@ def get_next_expiry(index_name: str, ref_date: Optional[date] = None) -> date:
         return _get_next_weekly_expiry(today, config['weekday'])
     else:  # monthly
         return _get_next_monthly_expiry(today, config['weekday'])
+
+
+def get_days_to_expiry(index_name: str, ref_date: Optional[date] = None) -> int:
+    """
+    A-3: Calculate number of calendar days between today and the next expiry.
+    """
+    today = ref_date or date.today()
+    expiry = get_next_expiry(index_name, today)
+    return (expiry - today).days
 
 
 def is_expiry_day(index_name: str, ref_date: Optional[date] = None) -> bool:

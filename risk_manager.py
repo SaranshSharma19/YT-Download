@@ -143,8 +143,7 @@ class RiskManager:
         if position_size > max_position_qty:
             self.logger.info(f"Position size capped at {self.max_position_size*100}% of capital")
             position_size = max_position_qty
-            risk_amount = position_size * stop_distance
-            risk_amount = position_size * stop_distance
+            risk_amount = position_size * stop_distance  # E-2: removed duplicate occurrence below
 
         # Ensure minimum position size is 1 (or adequate contract size)
         if position_size < 1 and position_size > 0.0:

@@ -402,20 +402,36 @@ class SignalValidator:
         return min(max(score, 0.0), 100.0)
 
     def _evaluate_vwap(self, df: pd.DataFrame, direction: str) -> float:
-        """Evaluate alignment with Volume Weighted Average Price."""
+        """A-4: Evaluate alignment with intraday VWAP (today's session only).
+
+        Previous implementation computed VWAP over the entire DataFrame (up to 30 days),
+        which produced a meaningless long-term average instead of the intraday VWAP.
+        Now correctly filters to the current IST trading day before cumulating.
+        """
         score = 50.0  # Neutral default
         try:
-            if len(df) < 20:
-                return score
+            import pytz as _pytz
+            ist = _pytz.timezone('Asia/Kolkata')
+            today = pd.Timestamp.now(tz=ist).date()
 
-            # Calculate VWAP: cumulative(TP * Volume) / cumulative(Volume)
-            typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-            cum_tp_vol = (typical_price * df['Volume']).cumsum()
-            cum_vol = df['Volume'].cumsum()
+            # A-4: Filter to today's intraday bars only
+            if df.index.tz is None:
+                df_today = df[df.index.tz_localize(ist).date == today].copy()
+            else:
+                df_today = df[df.index.tz_convert(ist).map(lambda t: t.date()) == today].copy()
+
+            if len(df_today) < 5:
+                self.logger.debug("[VWAP] Fewer than 5 intraday bars — returning neutral score 50")
+                return 50.0
+
+            # Calculate intraday VWAP
+            typical_price = (df_today['High'] + df_today['Low'] + df_today['Close']) / 3
+            cum_tp_vol = (typical_price * df_today['Volume']).cumsum()
+            cum_vol = df_today['Volume'].cumsum()
             vwap = cum_tp_vol / cum_vol
-            
-            curr_price = df['Close'].iloc[-1]
-            curr_vwap = vwap.iloc[-1]
+
+            curr_price = df_today['Close'].iloc[-1]
+            curr_vwap  = vwap.iloc[-1]
 
             if direction == 'CE':
                 if curr_price > curr_vwap:

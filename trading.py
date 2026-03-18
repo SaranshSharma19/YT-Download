@@ -90,12 +90,25 @@ except ImportError as e:
     SignalValidator = None
 
 try:
-    from expiry_utils import is_expiry_day, is_expiry_week, get_expiry_adjustment
+    from expiry_utils import (
+        is_expiry_day, is_expiry_week, get_expiry_adjustment, get_next_expiry
+    )
+    # get_days_to_expiry may not exist in older expiry_utils; handle gracefully
+    try:
+        from expiry_utils import get_days_to_expiry
+    except ImportError:
+        def get_days_to_expiry(index_name, from_date=None):
+            """Fallback: compute DTE from get_next_expiry."""
+            from datetime import date as _date
+            ref = from_date or _date.today()
+            expiry = get_next_expiry(index_name, ref)
+            return (expiry - ref).days
     from enhanced_features import add_enhanced_features
     from improved_targets import calculate_improved_targets
 except ImportError as e:
     print(f"Warning: Supplemental ML modules not fully available: {e}. Some features disabled.")
     is_expiry_day = is_expiry_week = get_expiry_adjustment = None
+    get_next_expiry = get_days_to_expiry = None
     add_enhanced_features = calculate_improved_targets = None
 
 # ================== State Management ==================
@@ -110,7 +123,13 @@ class TradingState:
             "open_positions": {},
             "last_update": None,
             "daily_pnl": 0.0,
-            "daily_trades": 0
+            "daily_trades": 0,
+            "daily_pnl_by_index": {
+                "NIFTY": 0.0,
+                "BANKNIFTY": 0.0,
+                "FINNIFTY": 0.0
+            },
+            "last_trade_close_time": {}  # A-7: Persist cooldown across restarts
         }
         self.load_state()
 
@@ -148,8 +167,8 @@ class TradingState:
             del self.state["open_positions"][symbol]
             self.save_state()
 
-    def update_daily_stats(self, pnl: float):
-        """Update daily P&L and trade count."""
+    def update_daily_stats(self, pnl: float, index_name: str = None):
+        """Update daily P&L and trade count globally and per-index."""
         # Check if it's a new day to reset
         last_update = self.state.get("last_update")
         if last_update:
@@ -157,9 +176,24 @@ class TradingState:
             if datetime.now().date() > last_date:
                 self.state["daily_pnl"] = 0.0
                 self.state["daily_trades"] = 0
+                self.state["daily_pnl_by_index"] = {
+                    "NIFTY": 0.0,
+                    "BANKNIFTY": 0.0,
+                    "FINNIFTY": 0.0
+                }
         
         self.state["daily_pnl"] += pnl
         self.state["daily_trades"] += 1
+        
+        # C-2: Update per-index P&L
+        if index_name:
+            if "daily_pnl_by_index" not in self.state:
+                self.state["daily_pnl_by_index"] = {"NIFTY": 0.0, "BANKNIFTY": 0.0, "FINNIFTY": 0.0}
+            if index_name in self.state["daily_pnl_by_index"]:
+                self.state["daily_pnl_by_index"][index_name] += pnl
+            else:
+                self.state["daily_pnl_by_index"][index_name] = pnl
+        
         self.save_state()
 
 # Suppress specific warnings
@@ -226,18 +260,16 @@ class Config:
     # Signal/logic parameters
 
     USE_EOD_SIGNALS = False         # If True, only act on closed daily candles (after market close)
-    AGREEMENT_STD_MAX = 0.35        # Max std dev of base model probabilities to consider consensus (more relaxed)
     ADX_MIN = 12.0                  # Minimal ADX to accept a trend-following trade (more relaxed)
-    CONFIRMATION_FILTERS = False    # Temporarily disable extra confirmations to increase signals
-    MIN_ATR_RATIO = 0.002           # Minimal ATR/Price ratio (more permissive)
     USE_FALLBACK_TREND_SIGNALS = True  # If ML is neutral, use trend/RSI fallback to emit a signal
+    # E-1: Removed AGREEMENT_STD_MAX, MIN_ATR_RATIO (orphaned, unused)
 
     # Confirmation/cooldown toggles
     CONFIRMATION_FILTERS = True     # Use RSI/SMA/MACD/VWAP confirmations
     ENABLE_VWAP_CONFIRMATION = True
     ENABLE_MACD_CONFIRMATION = True
     USE_BAR_CLOSE_ONLY = True       # Only act on closed bars (for 15m intraday)
-    COOLDOWN_BARS = 3               # Avoid multiple signals on same/new bar
+    COOLDOWN_MINUTES = 30           # A-7/E-1: Cooldown minutes after trade close (replaces COOLDOWN_BARS)
 
 
     # Data fetching parameters
@@ -262,7 +294,8 @@ class Config:
     # ===== NEW: Enhanced Features Configuration =====
     # Risk Management
     USE_RISK_MANAGER = True
-    ACCOUNT_BALANCE = 100000.0  # Initial capital
+    # A-10: Load ACCOUNT_BALANCE from environment variable so balance can be changed without editing code
+    ACCOUNT_BALANCE = float(os.getenv('ACCOUNT_BALANCE', '100000'))  # Initial capital
     RISK_PER_TRADE = 0.015      # 1.5% risk per trade
     MAX_DAILY_LOSS = 0.03       # 3% max daily loss
     
@@ -273,7 +306,8 @@ class Config:
     # Regime Detection
     USE_REGIME_DETECTION = True
     REGIME_ADX_THRESHOLD = 25.0
-    REGIME_LOOKBACK = 20 # Lowered from 100 for intraday responsiveness
+    # B-1: Increased from 20 to 60. 60 bars at 5m = 300 min ≈ full intraday session ATR context
+    REGIME_LOOKBACK = 60  # 60 bars at 5m = 300 min ≈ full intraday session ATR context
     
     # TradingView Integration
     USE_TRADINGVIEW_VALIDATION = True
@@ -574,7 +608,7 @@ class FeatureEngine:
                 ta_df = add_all_ta_features(
                     df, open="Open", high="High",
                     low="Low", close="Close",
-                    volume="Volume", fillna=True
+                    volume="Volume", fillna=False  # A-5: fillna=True fills NaN using future bars for early indicators — data leak
                 )
                 df = ta_df
             except Exception as e:
@@ -617,22 +651,46 @@ class FeatureEngine:
                 
                 df = df[existing_cols]
 
-            return df
-            # Final cleanup
+            # A-1: Final cleanup — MUST be before return (was dead code previously)
             df = df.replace([np.inf, -np.inf], np.nan)
-            # Forward-fill only to avoid future leakage; drop remaining NaNs or set conservative defaults
+
+            # A-5: Forward-fill only; never backward-fill (bfill leaks future data)
             df = df.ffill()
-            df = df.fillna(0)
+
+            # A-5: Drop columns that are entirely NaN before dropping rows
+            # If an indicator fails completely, it shouldn't kill all rows in the dataset
+            all_nan_cols = [c for c in df.columns if df[c].isna().all()]
+            if all_nan_cols:
+                logging.warning(f"[FeatureEngine] Dropping all-NaN columns (data failed or insufficient history): {all_nan_cols}")
+                df = df.drop(columns=all_nan_cols)
+
+            # A-5: Drop leading rows where feature-fill is impossible (no past data)
+            feature_cols = [c for c in df.columns if c not in ['Open', 'High', 'Low', 'Close', 'Volume']]
+            if feature_cols:
+                df = df.dropna(subset=feature_cols)
+            
+            logging.debug(f"[FeatureEngine] Rows after NaN drop: {len(df)}")
 
             # Prune constant features
             non_preserved_cols = [col for col in df.columns if col not in ['Open', 'High', 'Low', 'Close', 'Volume']]
             constant_cols = [col for col in non_preserved_cols if df[col].nunique() <= 1]
             df = df.drop(columns=constant_cols)
 
-            logging.info(f"Feature creation successful. Final DataFrame shape: {df.shape}")
+            # Update feature_cols to exclude dropped constant columns
+            feature_cols = [c for c in df.columns if c not in ['Open', 'High', 'Low', 'Close', 'Volume']]
+
+            # A-1: Verify all NaNs cleared
+            nan_count = df[feature_cols if feature_cols else df.columns].isna().sum().sum()
+            logging.debug(f"[FeatureEngine] NaN count post-cleanup: {nan_count}")
+            assert nan_count == 0, "NaN values remain after cleanup"
+
+            logging.info(f"[FeatureEngine] Feature creation successful. Final DataFrame shape: {df.shape}")
             return df
+        except AssertionError as ae:
+            logging.error(f"[FeatureEngine] Assertion failed: {ae}")
+            return pd.DataFrame()
         except Exception as e:
-            logging.error(f"Overall Feature creation failed: {str(e)}")
+            logging.error(f"[FeatureEngine] Overall feature creation failed: {str(e)}")
             import traceback
             logging.error(traceback.format_exc())
             return pd.DataFrame()
@@ -753,11 +811,11 @@ class ModelTrainer:
             X = X.replace([np.inf, -np.inf], np.nan)
             if X.isna().any().any():
                  self.logger.warning(f"NaNs found in features before training. Imputing...")
-                 # Fix: Global Data Leakage
-                 # Forward fill first to avoid leaking future data
-                 X = X.ffill()
-                 # If any NaNs remain at the very beginning, backward fill them 
-                 X = X.bfill()
+                 # A-2: Forward fill only — backward fill (bfill) propagates future values into past rows (data leakage)
+                 # REMOVED: bfill() caused data leakage — backward fill propagates
+                 # future values into past rows during model training
+                 X = X.ffill()       # forward-fill only — uses only past data
+                 X = X.dropna()      # drop rows that cannot be forward-filled
 
             self.feature_columns = feature_cols
             self.logger.info(f"Prepared data for training: {len(X)} samples, {len(feature_cols)} features. Target distribution:\n{y.value_counts()}")
@@ -1075,12 +1133,21 @@ class TradingBot:
         self.last_signal_bar = {}       # Track last emitted signal bar per index (cooldown)
         
         # ===== NEW: Initialize enhanced modules =====
+        # State Management
+        self.state = TradingState()
+        self.logger.info("Trading State initialized.")
+
         # Risk Manager
         if Config.USE_RISK_MANAGER and RiskManager is not None:
             self.risk_manager = RiskManager(
                 account_balance=Config.ACCOUNT_BALANCE
             )
-            self.logger.info(f"Risk Manager initialized with balance: ₹{Config.ACCOUNT_BALANCE:,.2f}")
+            # A-9/C-2: Sync RiskManager with persistent state from TradingState
+            self.risk_manager.daily_trades = self.state.state.get("daily_trades", 0)
+            self.risk_manager.daily_pnl = self.state.state.get("daily_pnl", 0.0)
+            self.risk_manager.account_balance = Config.ACCOUNT_BALANCE + self.risk_manager.daily_pnl
+            
+            self.logger.info(f"Risk Manager initialized with balance: ₹{Config.ACCOUNT_BALANCE:,.2f} (Daily PnL: ₹{self.risk_manager.daily_pnl:,.2f}, Trades: {self.risk_manager.daily_trades})")
         else:
             self.risk_manager = None
             if Config.USE_RISK_MANAGER:
@@ -1129,9 +1196,7 @@ class TradingBot:
              self.signal_validator = None
              self.logger.warning("Signal Validator not available.")
 
-        # State Management
-        self.state = TradingState()
-        self.logger.info("Trading State initialized.")
+        # State is now initialized earlier (before RiskManager)
 
     def get_dynamic_thresholds(self, regime: str) -> Dict:
         """Get confidence thresholds based on market regime."""
@@ -1143,6 +1208,27 @@ class TradingBot:
             'num_filters': 3,
             'description': 'Default (No Regime Detector)'
         }
+
+    @staticmethod
+    def get_session_phase(now_ist: 'pd.Timestamp') -> str:
+        """B-3: Classify the current time into an intraday trading session phase.
+
+        Returns one of: 'pre_open', 'opening', 'mid_session', 'afternoon', 'power_hour'
+        """
+        minutes = now_ist.hour * 60 + now_ist.minute
+        if minutes < 570:   return 'pre_open'    # before 09:30
+        if minutes < 630:   return 'opening'     # 09:30–10:30
+        if minutes < 750:   return 'mid_session' # 10:30–12:30
+        if minutes < 840:   return 'afternoon'   # 12:30–14:00
+        return 'power_hour'                       # 14:00–15:10
+
+    # B-3: Phase-specific ADX and validator boost config
+    PHASE_CONFIG = {
+        'opening':     {'min_adx': 18, 'validator_boost': -5},
+        'mid_session': {'min_adx': 12, 'validator_boost':  0},
+        'afternoon':   {'min_adx': 12, 'validator_boost':  0},
+        'power_hour':  {'min_adx': 20, 'validator_boost': +5},
+    }
 
     def _calculate_target(self, df: pd.DataFrame) -> pd.Series:
         """Calculates improved target labeling (triple-barrier method)."""
@@ -1160,14 +1246,28 @@ class TradingBot:
                     mode=Config.TARGET_MODE
                 )
             else:
-                # Fallback to the old simple return-based labeling
+                # A-8: Fallback three-class labeling (was binary [0,1] — mismatch with model expecting {0,1,2})
+                # 0=BEAR, 1=BULL, 2=NEUTRAL  (matches improved_targets convention)
                 horizon = Config.PREDICTION_HORIZON
                 threshold = Config.PRICE_MOVEMENT_THRESHOLD
-                fwd_returns = df["Close"].shift(-horizon) / df["Close"] - 1
-                conditions = [fwd_returns > threshold, fwd_returns < -threshold]
-                choices = [1.0, 0.0]
-                target = np.select(conditions, choices, default=np.nan)
-                return pd.Series(target, index=df.index, name='target')
+                future_return = df['Close'].shift(-horizon).pct_change(horizon)
+                up   = future_return >  threshold
+                down = future_return < -threshold
+                target = np.select([down, up], [0, 1], default=2)
+                target = pd.Series(target, index=df.index, name='target', dtype=float)
+                target[future_return.isna()] = np.nan  # NaN for rows with no future data
+
+                # Sanity check
+                assert set(target.dropna().unique()).issubset({0.0, 1.0, 2.0}), \
+                    "Target labels outside expected {0,1,2}"
+
+                label_dist = target.dropna().value_counts(normalize=True).to_dict()
+                self.logger.info(
+                    f"[Labels] BEAR:{label_dist.get(0.0, 0):.1%} "
+                    f"BULL:{label_dist.get(1.0, 0):.1%} "
+                    f"NEUTRAL:{label_dist.get(2.0, 0):.1%}"
+                )
+                return target
 
         except Exception as e:
             self.logger.error(f"Target calculation failed: {str(e)}")
@@ -1241,8 +1341,8 @@ class TradingBot:
             # Pass raw_df, FeatureEngine should return raw_df + features
             feature_df = self.feature_engine.create_features(raw_df.copy()) # Work on a copy
 
-            if feature_df.empty or len(feature_df) < len(raw_df):
-                 self.logger.error(f"Feature creation failed or lost data for {name}. Original: {len(raw_df)}, Features: {len(feature_df)}")
+            if feature_df.empty or len(feature_df) < len(raw_df) * 0.8:
+                 self.logger.error(f"Feature creation failed or lost significant data for {name}. Original: {len(raw_df)}, Features: {len(feature_df)}")
                  return
             feature_df.index = pd.to_datetime(feature_df.index)
             target_series.index = pd.to_datetime(target_series.index)
@@ -1341,6 +1441,30 @@ class TradingBot:
                     self.logger.debug(f"Expiry check failed: {e}")
                     expiry_adj = None
             
+            # B-3: Session Phase Awareness
+            now_ist = datetime.now(Config.TIMEZONE)
+            session_phase = self.get_session_phase(now_ist)
+            phase_cfg = self.PHASE_CONFIG.get(session_phase, {'min_adx': 12, 'validator_boost': 0})
+            self.logger.info(f"[Signal] [{name}] session_phase={session_phase} — phase_adx_min={phase_cfg['min_adx']}")
+
+            # B-2: Days-to-Expiry (DTE) Awareness
+            dte = -1
+            expiry_date = None
+            if get_days_to_expiry is not None:
+                try:
+                    dte = get_days_to_expiry(name, now_ist.date())
+                    self.logger.info(f"[Signal] [{name}] DTE={dte}")
+                except Exception as e:
+                    self.logger.debug(f"DTE calculation failed for {name}: {e}")
+
+            # DTE-based gates (reduce risk near expiry due to gamma/pin risk)
+            min_conviction_boost = 0.0
+            if dte == 0:      # Expiry day: require higher conviction
+                min_conviction_boost = 0.05
+                self.logger.info(f"[Signal] [{name}] Expiry day — min_conviction boosted by {min_conviction_boost}")
+            elif dte == 1:    # Day before expiry: mild boost
+                min_conviction_boost = 0.02
+
             # Fix 9: Cross-index correlation limit
             # Prevent concentrated same-direction bets across correlated indices
             open_positions = self.state.state.get('open_positions', {})
@@ -1646,7 +1770,61 @@ class TradingBot:
             # We removed the hard block here to avoid double-penalty. The validator's score penalty is sufficient.
             # If RSI exhaustion is severe, validator will score < threshold and trade will be rejected.
 
+            # B-5: Volume Confirmation Gate
+            # Require volume >= 70% of 20-bar average before generating a signal.
+            volume_ratio = 0.0
+            try:
+                if 'Volume' in raw_df.columns and len(raw_df) >= 20:
+                    avg_vol_20 = raw_df['Volume'].iloc[-20:].mean()
+                    current_vol = raw_df['Volume'].iloc[-1]
+                    volume_ratio = current_vol / avg_vol_20 if avg_vol_20 > 0 else 1.0
+                    if volume_ratio < 0.70:
+                        self.logger.info(
+                            f"[Signal] [{name}] Volume gate failed — "
+                            f"vol_ratio={volume_ratio:.2f} < 0.70 (current={current_vol:.0f}, avg20={avg_vol_20:.0f})"
+                        )
+                        return {
+                            'index': name, 'position_size': 0,
+                            'validation_reason': f"Low Volume ({volume_ratio:.2f}x avg)",
+                            'price': current_price, 'regime': regime
+                        }
+                    else:
+                        self.logger.debug(f"[Signal] [{name}] Volume gate passed — vol_ratio={volume_ratio:.2f}")
+            except Exception as e:
+                self.logger.debug(f"Volume gate check failed: {e}")
+
+            # B-4: Strengthened Choppy Regime Filter (RSI + MACD)
+            if regime in ('choppy', 'sideways'):
+                rsi_ok = True
+                macd_ok = True
+                try:
+                    rsi_col  = next((c for c in feature_df.columns if 'rsi' in c.lower()), None)
+                    macd_col = next((c for c in feature_df.columns if 'macd_diff' in c.lower() or 'macd_hist' in c.lower()), None)
+
+                    if rsi_col:
+                        rsi_val = float(feature_df[rsi_col].iloc[-1])
+                        if 40 <= rsi_val <= 60:  # RSI stuck in neutral — high chop probability
+                            rsi_ok = False
+                            self.logger.info(f"[Signal] [{name}] Choppy filter: RSI neutral ({rsi_val:.1f}) in choppy regime.")
+
+                    if macd_col:
+                        macd_hist = feature_df[macd_col].iloc[-3:]  # last 3 bars
+                        # Contracting histogram: momentum dying
+                        if len(macd_hist) >= 2 and (macd_hist.abs().diff().iloc[-1] < 0):
+                            macd_ok = False
+                            self.logger.info(f"[Signal] [{name}] Choppy filter: MACD histogram contracting in choppy regime.")
+                except Exception as e:
+                    self.logger.debug(f"Choppy regime RSI/MACD check failed: {e}")
+
+                if not rsi_ok or not macd_ok:
+                    return {
+                        'index': name, 'position_size': 0,
+                        'validation_reason': f"Choppy regime — RSI/MACD confirm chop",
+                        'price': current_price, 'regime': regime
+                    }
+
             # ADX Hard Gate: Require minimum trend strength for directional trades
+            # B-3: Use phase-specific ADX minimum
             adx_col = 'trend_adx' if 'trend_adx' in feature_df.columns else None
             if adx_col:
                 current_adx = feature_df[adx_col].iloc[-1]
@@ -1673,14 +1851,17 @@ class TradingBot:
                     current_adx = 0  # Cannot compute → fail closed (block trade)
                     self.logger.warning(f"ADX unavailable for {name}. Blocking trade (fail-safe).")
             
-            adx_threshold = regime_params.get('adx_min', 20)
+            adx_threshold = max(
+                regime_params.get('adx_min', 20),
+                phase_cfg.get('min_adx', 12)   # B-3: phase-specific minimum ADX
+            ) + min_conviction_boost * 10       # B-2: DTE-based conviction boost translates to ADX cushion
             if current_adx < adx_threshold:
                 self.logger.info(
-                    f"ADX too low for directional trade on {name}: ADX={current_adx:.1f} < {adx_threshold}. Skipping."
+                    f"[Signal] [{name}] ADX too low — ADX={current_adx:.1f} < {adx_threshold:.0f}. Skipping."
                 )
                 return {
-                    'index': name, 'position_size': 0, 
-                    'validation_reason': f"ADX Low ({current_adx:.1f})", 
+                    'index': name, 'position_size': 0,
+                    'validation_reason': f"ADX Low ({current_adx:.1f})",
                     'price': current_price, 'regime': regime
                 }
 
@@ -1782,18 +1963,25 @@ class TradingBot:
                      current_hour=current_hour
                 )
                 
-                # Slippage & Execution Friction Buffer
-                # Options typically have 1-2 pt slippage per leg.
-                # Adjust TP inward and SL outward for realistic fills.
+                # A-6: Slippage applied to ENTRY PRICE only, never to SL/TP levels
+                # SL and TP are structural/ATR levels derived from adjusted entry.
                 SLIPPAGE_PTS = 2.0
-                if direction == 'CE':
-                    exits['tp1'] = exits['tp1'] - SLIPPAGE_PTS
-                    exits['tp2'] = exits['tp2'] - SLIPPAGE_PTS
-                    exits['stop_loss'] = exits['stop_loss'] - SLIPPAGE_PTS
-                else:  # PE
-                    exits['tp1'] = exits['tp1'] + SLIPPAGE_PTS
-                    exits['tp2'] = exits['tp2'] + SLIPPAGE_PTS
-                    exits['stop_loss'] = exits['stop_loss'] + SLIPPAGE_PTS
+                if direction == 'CE':   # BUY
+                    entry_adjusted = current_price + SLIPPAGE_PTS
+                else:                   # PE (BUY PUT)
+                    entry_adjusted = current_price - SLIPPAGE_PTS
+
+                # Recalculate exits using the slippage-adjusted entry price
+                exits = self.risk_manager.calculate_exits(
+                    entry_price=entry_adjusted,
+                    direction=direction,
+                    atr=atr,
+                    df=feature_df,
+                    regime=regime,
+                    current_hour=current_hour
+                )
+                # Store adjusted entry back for signal output
+                current_price = entry_adjusted
                 
                 # Apply expiry day tightening to TP/SL
                 if expiry_adj:
@@ -1821,12 +2009,24 @@ class TradingBot:
             if position_size <= 0:
                 valid_signal = False
 
-            # 9. Construct Final Signal
+            # 9. Construct Final Signal — enriched with all context metadata
+            # D-2: Compute recommended strike
+            recommended_strike, _ = self._get_recommended_strike(
+                name, current_price, direction, regime, dte
+            ) if dte >= 0 else (self._get_atm_strike(name, current_price), None)
+
+            # D-3: Compute expiry label
+            try:
+                expiry_label = str(get_next_expiry(name, now_ist.date())) if get_next_expiry else 'N/A'
+            except Exception:
+                expiry_label = 'N/A'
+
             signal = {
                 'index': name,
                 'direction': direction,
                 'price': current_price,
                 'confidence': probability,
+                'timestamp': datetime.now(Config.TIMEZONE).isoformat(),
                 'time': datetime.now(Config.TIMEZONE).strftime("%H:%M:%S"),
                 'regime': regime,
                 'atr': atr,
@@ -1836,12 +2036,20 @@ class TradingBot:
                 'take_profit_1': exits.get('tp1'),
                 'take_profit_2': exits.get('tp2'),
                 'validation_score': score if 'score' in locals() else None,
-                'validation_reason': reason if 'reason' in locals() else "Low Confidence"
+                'validation_reason': reason if 'reason' in locals() else "Low Confidence",
+                # D-1/D-2: New metadata for rich signal card
+                'strike': recommended_strike,
+                'expiry': expiry_label,
+                'dte': dte,
+                'session_phase': session_phase if 'session_phase' in locals() else 'unknown',
+                'volume_ratio': round(volume_ratio, 2) if 'volume_ratio' in locals() else 0.0,
+                'adx': round(float(current_adx), 1) if 'current_adx' in locals() else 0.0,
             }
-            
-            # Print Actionable Signal Card ONLY if approved
+
+            # Print Actionable Signal Card and save JSON ONLY if approved
             if position_size > 0:
                 self.print_signal_card(signal)
+                self._save_signal_json(signal)  # D-3: write signals/latest_signal.json + history
 
             return signal
 
@@ -1852,115 +2060,143 @@ class TradingBot:
             return None
 
     def print_signal_card(self, signal: Dict):
-        """Prints a beautifully formatted, colored signal card to the console."""
-        
-        name = signal['index']
-        direction = signal['direction']
-        price = signal['price']
-        sl = signal['stop_loss']
-        tp1 = signal['take_profit_1']
-        tp2 = signal['take_profit_2']
-        conf = signal['confidence'] * 100
-        score = signal.get('validation_score', 0)
-        contract = signal.get('contract', 'N/A')
-        
-        # Color definitions
-        GREEN = "\033[92m"
-        RED = "\033[91m"
-        YELLOW = "\033[93m"
-        CYAN = "\033[96m"
-        BOLD = "\033[1m"
-        RESET = "\033[0m"
-        
-        border_color = GREEN if direction == "CE" else RED
-        action_color = GREEN if direction == "CE" else RED
-        action_text = "BUY CALL (CE)" if direction == "CE" else "BUY PUT (PE)"
-        
-        # Calculate the 1:1 R:R trailing trigger price
-        risk = abs(price - sl)
-        if direction == "CE":
-            trail_trigger = price + risk  # 1:1 R:R for longs
-        else:
-            trail_trigger = price - risk  # 1:1 R:R for shorts
-        
-        print(f"\n{border_color}" + "="*60 + f"{RESET}")
-        print(f"{border_color}║ {BOLD}⚡ TRADE SIGNAL ALERT: {name:<30}{RESET} {border_color}║{RESET}")
-        print(f"{border_color}" + "="*60 + f"{RESET}")
-        print(f"{border_color}║ {RESET}Action:      {action_color}{BOLD}{action_text:<38}{RESET} {border_color}║{RESET}")
-        print(f"{border_color}║ {RESET}Entry Price: {CYAN}{price:<.2f}{RESET}{' '*30} {border_color}║{RESET}")
-        print(f"{border_color}║ {RESET}Stop Loss:   {YELLOW}{sl:<.2f}{RESET} (Structural/ATR){' '*16} {border_color}║{RESET}")
-        print(f"{border_color}║ {RESET}Target 1:    {GREEN}{tp1:<.2f}{RESET}{' '*30} {border_color}║{RESET}")
-        print(f"{border_color}║ {RESET}Target 2:    {GREEN}{tp2:<.2f}{RESET} (Runner){' '*21} {border_color}║{RESET}")
-        print(f"{border_color}║ {RESET}Contract:    {BOLD}{contract:<38}{RESET} {border_color}║{RESET}")
-        print(f"{border_color}║ {RESET}Confidence:  {conf:<.1f}% | Score: {score:.1f}/100{' '*16} {border_color}║{RESET}")
-        print(f"{border_color}" + "-"*60 + f"{RESET}")
-        print(f"{border_color}║ {YELLOW}⚠️  TRAIL SL to Entry ({price:.2f}) when price hits {trail_trigger:.2f}{RESET}")
-        print(f"{border_color}" + "="*60 + f"{RESET}\n")
+        """D-1: Prints a rich, institutional-grade signal alert to console and log."""
+        name       = signal.get('index', 'N/A')
+        direction  = signal.get('direction', 'N/A')
+        price      = signal.get('price', 0)
+        sl         = signal.get('stop_loss', 0) or 0
+        tp1        = signal.get('take_profit_1', 0) or 0
+        tp2        = signal.get('take_profit_2', 0) or 0
+        conf       = signal.get('confidence', 0) or 0
+        score      = signal.get('validation_score', 0) or 0
+        regime     = signal.get('regime', 'N/A')
+        dte        = signal.get('dte', '?')
+        strike     = signal.get('strike', 'ATM')
+        expiry     = signal.get('expiry', 'N/A')
+        vol_ratio  = signal.get('volume_ratio', 0) or 0
+        session    = signal.get('session_phase', 'N/A')
+        adx        = signal.get('adx', 0) or 0
+        ts         = datetime.now(Config.TIMEZONE).strftime('%Y-%m-%d %H:%M:%S IST')
+
+        risk_amt = abs(price - sl) if sl else 0
+        reward1  = abs(tp1 - price) if tp1 else 0
+        rr_ratio = reward1 / risk_amt if risk_amt > 0 else 0
+        signal['rr_ratio'] = round(rr_ratio, 2)  # enrich signal dict
+
+        dir_label  = 'CE (BULLISH)' if direction == 'CE' else 'PE (BEARISH)'
+
+        box = (
+            f"\n╔══════════════════════════════════════════════════╗\n"
+            f"║  SIGNAL ALERT — {ts:<33}║\n"
+            f"╠══════════════════════════════════════════════════╣\n"
+            f"║  Index     : {name:<36}║\n"
+            f"║  Direction : {dir_label:<36}║\n"
+            f"║  Spot Price: {price:<36.2f}║\n"
+            f"║  Strike    : {str(strike) + ' ' + direction:<36}║\n"
+            f"║  Expiry    : {str(expiry) + '  (' + str(dte) + 'd to expiry)':<36}║\n"
+            f"╠══════════════════════════════════════════════════╣\n"
+            f"║  ENTRY     : {price:<36.2f}║\n"
+            f"║  STOP LOSS : {sl:<.2f}  (risk: ₹{risk_amt:<.2f}){'':<10}║\n"
+            f"║  TARGET 1  : {tp1:<.2f}  (partial exit — 50%){'':<9}║\n"
+            f"║  TARGET 2  : {tp2:<36.2f}║\n"
+            f"║  R:R Ratio : 1:{rr_ratio:<33.1f}║\n"
+            f"╠══════════════════════════════════════════════════╣\n"
+            f"║  CONFIDENCE: {conf:.1%}{'':<33}║\n"
+            f"║  Regime    : {regime:<36}║\n"
+            f"║  Validator : {score:<.1f}/100{'':<31}║\n"
+            f"║  Volume    : {vol_ratio:<.1f}x avg{'':<30}║\n"
+            f"║  Session   : {session:<36}║\n"
+            f"║  ADX       : {adx:<36.1f}║\n"
+            f"╚══════════════════════════════════════════════════╝"
+        )
+        print(box)
+        self.logger.info(
+            f"[Signal] [{name}] {direction} signal — confidence={conf:.1%}, "
+            f"regime={regime}, score={score:.1f}, dte={dte}, session={session}, adx={adx:.1f}, vol={vol_ratio:.2f}x"
+        )
 
     def _get_atm_strike(self, index_name: str, spot_price: float) -> int:
         """Calculate ATM strike price based on index."""
         if "BANK" in index_name:
-            # Round to nearest 100
-            return int(round(spot_price / 100) * 100)
+            return int(round(spot_price / 100) * 100)  # Step = 100
         else:
-            # NIFTY and FINNIFTY round to nearest 50
-            return int(round(spot_price / 50) * 50)
+            return int(round(spot_price / 50) * 50)   # Step = 50 (NIFTY / FINNIFTY)
 
-    def _get_next_expiry(self, index_name: str) -> datetime:
-        """
-        Get the next expiry date based on new SEBI rules (Nov 2024).
-        - NIFTY: Weekly (Thursday)
-        - BANKNIFTY: Monthly Only (Last Wednesday of Month)
-        - FINNIFTY: Monthly Only (Last Tuesday of Month)
-        """
-        today = datetime.now(Config.TIMEZONE).date()
-        
-        # 1. NIFTY - Weekly Expiry (Thursday)
-        if index_name == "NIFTY":
-            target_weekday = 3 # Thursday
-            days_ahead = target_weekday - today.weekday()
-            if days_ahead <= 0: # Target day already happened this week
-                if days_ahead == 0 and datetime.now(Config.TIMEZONE).hour >= 15:
-                     days_ahead += 7
-                elif days_ahead < 0:
-                     days_ahead += 7
-            return today + timedelta(days=days_ahead)
+    def _get_recommended_strike(self, index_name: str, spot_price: float,
+                                direction: str, regime: str, dte: int) -> Tuple[int, int]:
+        """D-2: Return (recommended_strike, strike_step) based on regime and DTE.
 
-        # 2. Monthly Expiry Logic (BankNifty/FinNifty)
-        # Find the last occurrence of specific weekday in the current month
-        year = today.year
-        month = today.month
-        
-        if "BANK" in index_name:
-            target_weekday = 2 # Wednesday
-        elif "FIN" in index_name:
-            target_weekday = 1 # Tuesday
-        
-        def get_last_weekday_of_month(y, m, weekday):
-            # Start from the last day of the month and move back
-            if m == 12:
-                next_month = datetime(y + 1, 1, 1)
+        Selection rules:
+            trending regime + DTE > 1 : ATM (max delta)
+            choppy regime             : 1 strike OTM (reduce premium cost)
+            expiry day (DTE == 0)     : ATM only (avoid OTM gamma risk)
+        """
+        # Determine strike step per index
+        STRIKE_STEPS = {'NIFTY': 50, 'BANKNIFTY': 100, 'FINNIFTY': 50}
+        step = STRIKE_STEPS.get(index_name, 50)
+        atm = int(round(spot_price / step) * step)
+
+        if dte == 0:  # Expiry day: ATM only
+            return atm, step
+        if regime in ('choppy', 'sideways'):
+            # 1 OTM strike to reduce premium
+            if direction == 'CE':
+                return atm + step, step
             else:
-                next_month = datetime(y, m + 1, 1)
-            
-            last_day = next_month - timedelta(days=1)
-            
-            # Move back until we find the target weekday
-            while last_day.weekday() != weekday:
-                last_day -= timedelta(days=1)
-            return last_day.date()
-        
-        current_month_expiry = get_last_weekday_of_month(year, month, target_weekday)
-        
-        # If today is past the monthly expiry (or too late on expiry day), move to next month
-        if today > current_month_expiry or (today == current_month_expiry and datetime.now(Config.TIMEZONE).hour >= 15):
-             if month == 12:
-                 current_month_expiry = get_last_weekday_of_month(year + 1, 1, target_weekday)
-             else:
-                 current_month_expiry = get_last_weekday_of_month(year, month + 1, target_weekday)
-                 
-        return current_month_expiry
-        print(f"{border_color}" + "="*60 + f"{RESET}\n")
+                return atm - step, step
+        # Default: ATM for trending or unknown
+        return atm, step
+
+    def _save_signal_json(self, signal: Dict):
+        """D-3: Write signal to signals/latest_signal.json (overwrite) and append to signal_history.json."""
+        try:
+            import json as _json
+            signals_dir = os.path.join(Config.BASE_DIR, 'signals')
+            os.makedirs(signals_dir, exist_ok=True)
+
+            payload = {
+                'timestamp':       signal.get('timestamp', datetime.now(Config.TIMEZONE).isoformat()),
+                'index':           signal.get('index'),
+                'direction':       signal.get('direction'),
+                'spot_price':      round(float(signal.get('price', 0)), 2),
+                'strike':          signal.get('strike'),
+                'expiry':          str(signal.get('expiry', '')),
+                'dte':             signal.get('dte', -1),
+                'entry':           round(float(signal.get('price', 0)), 2),
+                'stop_loss':       round(float(signal.get('stop_loss') or 0), 2),
+                'target1':         round(float(signal.get('take_profit_1') or 0), 2),
+                'target2':         round(float(signal.get('take_profit_2') or 0), 2),
+                'rr_ratio':        signal.get('rr_ratio', 0.0),
+                'confidence':      round(float(signal.get('confidence', 0)), 4),
+                'regime':          signal.get('regime', 'unknown'),
+                'validator_score': signal.get('validation_score', 0),
+                'volume_ratio':    round(float(signal.get('volume_ratio', 0)), 2),
+                'session_phase':   signal.get('session_phase', 'unknown'),
+                'adx':             round(float(signal.get('adx', 0)), 1),
+                'status':          'PENDING',
+            }
+
+            # Overwrite latest_signal.json
+            latest_path = os.path.join(signals_dir, 'latest_signal.json')
+            with open(latest_path, 'w') as f:
+                _json.dump(payload, f, indent=2, default=str)
+
+            # Append to signal_history.json
+            history_path = os.path.join(signals_dir, 'signal_history.json')
+            history = []
+            if os.path.exists(history_path):
+                try:
+                    with open(history_path, 'r') as f:
+                        history = _json.load(f)
+                except Exception:
+                    history = []
+            history.append(payload)
+            with open(history_path, 'w') as f:
+                _json.dump(history, f, indent=2, default=str)
+
+            self.logger.info(f"[Signal] [{signal.get('index')}] JSON saved — {latest_path}")
+        except Exception as e:
+            self.logger.warning(f"[Signal] Failed to save signal JSON: {e}")
 
     def print_dashboard(self, results: List[Dict]):
         """Prints a summary dashboard of the trading cycle."""
@@ -2056,9 +2292,10 @@ class TradingBot:
             # Check for cooldown
             if name in self.last_signal_bar:
                 time_since_last_signal = pd.Timestamp.now() - self.last_signal_bar[name]
-                cooldown_minutes = 30 # Cooldown of 30 minutes after a trade closes
+                # A-7: Use Config.COOLDOWN_MINUTES (was hardcoded 30, now reads from Config)
+                cooldown_minutes = getattr(Config, 'COOLDOWN_MINUTES', 30)
                 if time_since_last_signal < pd.Timedelta(minutes=cooldown_minutes):
-                    self.logger.info(f"Cooldown active for {name}. Skipping entry.")
+                    self.logger.info(f"[{name}] Cooldown active — {time_since_last_signal.seconds//60}m elapsed of {cooldown_minutes}m. Skipping entry.")
                     return {'index': name, 'status': 'Cooldown'}
             # Check daily limits first
             limit_status = self.risk_manager.check_daily_limits() if self.risk_manager else 1.0
@@ -2158,8 +2395,8 @@ class TradingBot:
                                 pnl=net_pnl
                             )
                         
-                        self.state.remove_position(name)
-                        self.state.update_daily_stats(net_pnl)
+                        self.state.remove_position(symbol)
+                        self.state.update_daily_stats(net_pnl, index_name=name)
                         self.logger.info(f"Emergency exit complete for {name}.")
                         return
             # Fix 10: Automated Trailing Stop
@@ -2180,6 +2417,25 @@ class TradingBot:
                         position['sl'] = new_sl
                         sl = new_sl
                         self.state.save_state()  # Persist the updated SL
+
+            # C-1: STT Trap Alert for PE on Expiry Day
+            # If holding a PE position on expiry day after 15:00 IST and price is within
+            # 0.5% of the long put strike, warn about the STT trap on exercise settlement.
+            try:
+                if direction == 'PE' and is_expiry_day is not None:
+                    pos_index = position.get('index', name)
+                    now_ist = datetime.now(Config.TIMEZONE)
+                    if is_expiry_day(pos_index) and now_ist.hour >= 15:
+                        entry_strike = position.get('strike', entry_price)  # Use stored strike if available
+                        dist_from_strike_pct = abs(current_price - entry_strike) / entry_strike if entry_strike else 0
+                        if dist_from_strike_pct <= 0.005:  # Within 0.5% of strike
+                            self.logger.warning(
+                                f"[RiskMgr] [{name}] ⚠️ STT TRAP ALERT — "
+                                f"PE on expiry day, price={current_price:.2f} within 0.5% of strike={entry_strike:.0f}. "
+                                f"Do NOT let this expire ITM — manual exit strongly advised."
+                            )
+            except Exception as e:
+                self.logger.debug(f"STT trap check failed: {e}")
 
             # Check Exit Conditions
             exit_reason = None
@@ -2232,9 +2488,9 @@ class TradingBot:
                             pnl=partial_pnl
                         )
                     
-                    # Update daily stats with partial P&L
-                    self.state.update_daily_stats(partial_pnl)
-                    self.state.save_state()
+                    # Add partial profit to daily P&L
+                    self.state.update_daily_stats(partial_pnl, index_name=name)
+                    self.state.save_state()  # Store updated position
                     return  # Don't check full exit conditions this cycle
             
             if direction == "CE":
@@ -2283,8 +2539,8 @@ class TradingBot:
                 
                 # Update State — use `name` (e.g., 'NIFTY') not `symbol` (e.g., '^NSEI')
                 # This matches how execute_trade_lifecycle looks up positions by name.
-                self.state.remove_position(name)
-                self.state.update_daily_stats(net_pnl)
+                self.state.remove_position(symbol)
+                self.state.update_daily_stats(net_pnl, index_name=name)
                 
                 # Notify User (via log)
                 self.logger.info(f"Trade Closed: {name} {direction} | Net P&L: {net_pnl:.2f}")
@@ -2474,12 +2730,22 @@ class TradingBot:
                                     )
                                 
                                 self.state.remove_position(pos_name)
-                                self.state.update_daily_stats(pnl)
+                                self.state.update_daily_stats(pnl, index_name=pos_name)
                                 
                             except Exception as e:
                                 self.logger.error(f"Error during EOD square-off for {pos_name}: {e}")
                         
                         self.logger.info("✅ EOD square-off complete. All positions closed.")
+
+                # C-3: Auto daily summary at market close (after 15:30 IST)
+                if current_time.hour >= 15 and current_time.minute >= 30:
+                    daily_pnl = getattr(self.risk_manager, 'daily_pnl', 0.0) if self.risk_manager else 0.0
+                    daily_trades = getattr(self.risk_manager, 'daily_trades', 0) if self.risk_manager else 0
+                    self.logger.info(
+                        f"[DailySummary] Date={current_time.date()} — "
+                        f"Trades={daily_trades}, Net_PnL=₹{daily_pnl:.2f}, "
+                        f"Account=₹{getattr(self.risk_manager, 'account_balance', 0):.2f}"
+                    )
                 
                 # Proceed with scanning
                 self.logger.info("Market open. Executing trade lifecycle...")
