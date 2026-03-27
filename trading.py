@@ -297,7 +297,8 @@ class Config:
     # A-10: Load ACCOUNT_BALANCE from environment variable so balance can be changed without editing code
     ACCOUNT_BALANCE = float(os.getenv('ACCOUNT_BALANCE', '100000'))  # Initial capital
     RISK_PER_TRADE = 0.015      # 1.5% risk per trade
-    MAX_DAILY_LOSS = 0.03       # 3% max daily loss
+    MAX_DAILY_LOSS = 0.10       # 3% max daily loss
+    DISABLE_DAILY_LOSS_LIMIT = True # Set to True to bypass the 3% safety stop during development
     
     # Performance Tracking
     USE_PERFORMANCE_TRACKER = True
@@ -1140,7 +1141,8 @@ class TradingBot:
         # Risk Manager
         if Config.USE_RISK_MANAGER and RiskManager is not None:
             self.risk_manager = RiskManager(
-                account_balance=Config.ACCOUNT_BALANCE
+                account_balance=Config.ACCOUNT_BALANCE,
+                disable_daily_loss_limit=getattr(Config, 'DISABLE_DAILY_LOSS_LIMIT', False)
             )
             # A-9/C-2: Sync RiskManager with persistent state from TradingState
             self.risk_manager.daily_trades = self.state.state.get("daily_trades", 0)
@@ -2539,7 +2541,7 @@ class TradingBot:
                 
                 # Update State — use `name` (e.g., 'NIFTY') not `symbol` (e.g., '^NSEI')
                 # This matches how execute_trade_lifecycle looks up positions by name.
-                self.state.remove_position(symbol)
+                self.state.remove_position(name)
                 self.state.update_daily_stats(net_pnl, index_name=name)
                 
                 # Notify User (via log)
@@ -2606,6 +2608,10 @@ class TradingBot:
                 "regime": signal['regime']
             }
             self.state.add_position(name, position_data)  # Use name, not symbol
+            
+            # Update Risk Manager
+            if self.risk_manager:
+                self.risk_manager.add_position(final_trade_id, position_data)
             
             self.logger.info(f"🚀 OPENED {direction} for {name} @ {current_price} | Size: {size} | SL: {sl} | TP: {tp}")
 

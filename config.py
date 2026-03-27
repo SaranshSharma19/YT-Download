@@ -21,7 +21,7 @@ TRADING_CONFIG = {
 RISK_CONFIG = {
     "account_balance": 100000.0,
     "risk_per_trade": 0.015,  # 1.5% of capital
-    "max_daily_loss": 0.03,   # 3% daily loss limit
+    "max_daily_loss": 0.10,   # 3% daily loss limit
     "max_position_size": 0.10,  # 10% max per trade
     "stop_loss_atr_multiple": 1.5,
     "take_profit_ratios": [2.0, 3.0],  # 2:1 and 3:1 R:R

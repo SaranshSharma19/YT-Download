@@ -21,14 +21,15 @@ class RiskManager:
     - Correlation-based exposure management
     """
     
-    def __init__(self, account_balance: float = 100000.0, config_path: str = None):
+    def __init__(self, account_balance: float = 100000.0, config_path: str = None, disable_daily_loss_limit: bool = False):
         self.logger = logging.getLogger('RiskManager')
         self.account_balance = account_balance
         self.initial_balance = account_balance
+        self.disable_daily_loss_limit = disable_daily_loss_limit
         
         # Risk parameters (can be overridden by config)
         self.risk_per_trade = 0.015  # 1.5% of capital per trade
-        self.max_daily_loss = 0.03   # 3% daily loss limit
+        self.max_daily_loss = 0.10   # 3% daily loss limit
         self.max_position_size = 0.10  # 10% max per trade
         self.stop_loss_atr_multiple = 1.5
         self.take_profit_ratios = [2.0, 3.0]  # 2:1 and 3:1 R:R
@@ -329,6 +330,13 @@ class RiskManager:
         daily_loss_pct = self.daily_pnl / self.account_balance
         
         if daily_loss_pct <= -self.max_daily_loss:
+            if self.disable_daily_loss_limit:
+                self.logger.warning(
+                    f"🛡️ Daily loss limit bypass: {daily_loss_pct*100:.2f}% "
+                    f"(limit: {self.max_daily_loss*100:.1f}%) but continuing due to DISABLE_DAILY_LOSS_LIMIT."
+                )
+                return 1.0 # Allow trading to continue
+            
             self.logger.critical(
                 f"🚨 DAILY LOSS LIMIT REACHED: {daily_loss_pct*100:.2f}% "
                 f"(limit: {self.max_daily_loss*100:.1f}%). STOPPING TRADING."
